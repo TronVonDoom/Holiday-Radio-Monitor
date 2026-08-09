@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# runtime state
+data/
+playlists/
+.testcfg/
+.testplaylists/
+*.db
+*.db-wal
+*.db-shm

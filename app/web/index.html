@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en" data-holiday="halloween">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Holiday Radio Matcher</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="/icon.svg" alt="" width="38" height="38">
+      <div>
+        <strong>Holiday Radio</strong>
+        <span>Matcher</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button data-view="dashboard" class="active"><i data-i="grid"></i>Dashboard</button>
+      <button data-view="review"><i data-i="check"></i>Review<span class="pill" id="pill-review">0</span></button>
+      <button data-view="library"><i data-i="disc"></i>Library</button>
+      <button data-view="playlists"><i data-i="list"></i>Playlists</button>
+      <button data-view="stations"><i data-i="radio"></i>Stations</button>
+      <button data-view="settings"><i data-i="gear"></i>Settings</button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="worker" id="worker-state"><span class="dot"></span><span>Idle</span></div>
+      <div class="ver" id="app-version"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="view-title">Dashboard</h1>
+        <p id="view-sub">Live monitoring across your holiday stations</p>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn ghost" id="btn-refresh" title="Refresh now"><i data-i="refresh"></i></button>
+        <button class="btn" id="btn-sync"><i data-i="upload"></i>Sync playlists</button>
+      </div>
+    </header>
+
+    <section class="view" id="view-dashboard"></section>
+    <section class="view hidden" id="view-review"></section>
+    <section class="view hidden" id="view-library"></section>
+    <section class="view hidden" id="view-playlists"></section>
+    <section class="view hidden" id="view-stations"></section>
+    <section class="view hidden" id="view-settings"></section>
+  </main>
+</div>
+
+<div id="toasts" class="toasts"></div>
+<div id="modal" class="modal hidden"><div class="modal-card" id="modal-card"></div></div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

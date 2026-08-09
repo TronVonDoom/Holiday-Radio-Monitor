@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.testcfg
+.testplaylists
+data
+playlists
+tools
+unraid
+README.md
+docker-compose.yml
+**/__pycache__
+**/*.pyc
+.venv
+venv

@@ -1,0 +1,334 @@
+"""Background loops: poll stations, resolve songs, deliver playlists.
+
+Three cooperating tasks run for the life of the process:
+
+  poll_loop   - reads each enabled station and records what it played
+  match_loop  - drains the pending queue through the matching engine
+  sync_loop   - pushes confirmed matches to Spotify and the .m3u8 files
+
+They are deliberately separate: metadata polling must stay punctual even when
+MusicBrainz is throttling us, and playlist delivery must not block either.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from typing import Any
+
+from . import db, matcher, playlists, sources
+from .normalize import fingerprint, is_junk_album, norm_key, titlecase_display
+
+# How many songs one matcher pass will resolve. Kept small so the loop stays
+# responsive and MusicBrainz's 1 req/sec budget is spent steadily.
+MATCH_BATCH = 8
+
+# A song whose providers were unreachable is retried with escalating backoff
+# rather than being written off as unmatched.
+MAX_RETRY_ATTEMPTS = 6
+RETRY_BACKOFF_SECONDS = 90
+
+_tasks: list[asyncio.Task] = []
+_state: dict[str, Any] = {"polling": False, "matching": False, "last_poll": 0}
+
+
+# --- ingestion ---------------------------------------------------------------
+
+def _upsert_song(obs: sources.Observation) -> int:
+    fp = fingerprint(obs.artist, obs.title, obs.external_id)
+    album = "" if is_junk_album(obs.album) else obs.album
+    now = db.now()
+
+    row = db.query_one("SELECT id, duration, art_url FROM songs WHERE fingerprint = ?", (fp,))
+    if row is not None:
+        db.execute(
+            "UPDATE songs SET last_seen_at = ?, play_count = play_count + 1, "
+            "duration = COALESCE(?, duration), art_url = COALESCE(NULLIF(?, ''), art_url) "
+            "WHERE id = ?",
+            (now, obs.duration, obs.art_url, row["id"]),
+        )
+        return int(row["id"])
+
+    cur = db.execute(
+        "INSERT INTO songs (fingerprint, raw_artist, raw_title, raw_album, norm_artist, "
+        "norm_title, duration, art_url, status, play_count, first_seen_at, last_seen_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)",
+        (fp, obs.artist, obs.title, album, norm_key(obs.artist), norm_key(obs.title),
+         obs.duration, obs.art_url, now, now),
+    )
+    return int(cur.lastrowid)
+
+
+def ingest(station_id: int, observations: list[sources.Observation]) -> int:
+    """Record observations, returning how many genuinely new plays were stored."""
+    new_plays = 0
+    last = db.query_one(
+        "SELECT song_id FROM plays WHERE station_id = ? ORDER BY played_at DESC, id DESC LIMIT 1",
+        (station_id,),
+    )
+    last_song_id = int(last["song_id"]) if last else None
+
+    # Oldest first so the history backfills in the order it actually aired.
+    for obs in sorted(observations, key=lambda o: o.played_at):
+        if not (obs.artist or obs.title):
+            continue
+        song_id = _upsert_song(obs)
+
+        played_at = obs.played_at
+        if played_at <= 0:
+            # Sources without timestamps (ICY) can only tell us "this is on now",
+            # so we only record a play when the track actually changed.
+            if song_id == last_song_id:
+                continue
+            played_at = db.now()
+
+        cur = db.execute(
+            "INSERT OR IGNORE INTO plays (station_id, song_id, played_at) VALUES (?, ?, ?)",
+            (station_id, song_id, played_at),
+        )
+        if cur.rowcount:
+            new_plays += 1
+            last_song_id = song_id
+
+    return new_plays
+
+
+async def poll_station(station: dict[str, Any]) -> None:
+    try:
+        observations, source = await sources.fetch_station(station)
+    except Exception as exc:  # noqa: BLE001 - shown in the UI, never fatal
+        db.execute(
+            "UPDATE stations SET last_polled_at = ?, last_error = ? WHERE id = ?",
+            (db.now(), str(exc)[:500], station["id"]),
+        )
+        return
+
+    new_plays = ingest(int(station["id"]), observations)
+    db.execute(
+        "UPDATE stations SET last_polled_at = ?, last_error = NULL WHERE id = ?",
+        (db.now(), station["id"]),
+    )
+    if new_plays:
+        db.log_event(f"{station['name']}: +{new_plays} play(s) via {source}",
+                     source="poll")
+
+
+async def poll_once() -> None:
+    stations = [dict(r) for r in db.query("SELECT * FROM stations WHERE enabled = 1")]
+    if not stations:
+        return
+    _state["polling"] = True
+    try:
+        await asyncio.gather(*(poll_station(s) for s in stations), return_exceptions=True)
+        _state["last_poll"] = db.now()
+    finally:
+        _state["polling"] = False
+
+
+# --- matching ----------------------------------------------------------------
+
+def _store_candidates(song_id: int, candidates: list[dict[str, Any]]) -> None:
+    import json
+
+    db.execute("DELETE FROM candidates WHERE song_id = ?", (song_id,))
+    rows = []
+    for rank, cand in enumerate(candidates):
+        rows.append((
+            song_id, cand.get("source", ""), cand.get("ext_id", ""),
+            cand.get("artist", ""), cand.get("title", ""), cand.get("album", ""),
+            cand.get("duration"), cand.get("art_url", ""), cand.get("url", ""),
+            cand.get("uri", ""), cand.get("isrc", ""), float(cand.get("score", 0)),
+            json.dumps(cand.get("score_detail", {})), rank, db.now(),
+        ))
+    if rows:
+        db.executemany(
+            "INSERT OR REPLACE INTO candidates (song_id, source, ext_id, artist, title, "
+            "album, duration, art_url, url, uri, isrc, score, score_detail, rank, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def apply_match(song_id: int, best: dict[str, Any], status: str,
+                confidence: float, method: str) -> None:
+    db.execute(
+        "UPDATE songs SET status = ?, confidence = ?, match_method = ?, "
+        "match_artist = ?, match_title = ?, match_album = ?, match_duration = ?, "
+        "mbid = ?, isrc = ?, spotify_id = ?, spotify_uri = ?, spotify_url = ?, "
+        "match_art_url = ?, resolved_at = ? WHERE id = ?",
+        (
+            status, confidence, method,
+            titlecase_display(best.get("artist", "")),
+            titlecase_display(best.get("title", "")),
+            best.get("album", ""), best.get("duration"),
+            best.get("mbid") or (best.get("ext_id") if best.get("source") == "musicbrainz" else None),
+            best.get("isrc") or None,
+            best.get("spotify_id") or (best.get("ext_id") if best.get("source") == "spotify" else None),
+            best.get("uri") or None,
+            best.get("url") or None,
+            best.get("art_url") or None,
+            db.now(), song_id,
+        ),
+    )
+
+
+def enqueue_for_playlists(song_id: int) -> None:
+    """Add a resolved song to the playlist of every station that has played it."""
+    stations = db.query(
+        "SELECT DISTINCT station_id FROM plays WHERE song_id = ?", (song_id,)
+    )
+    for row in stations:
+        db.execute(
+            "INSERT OR IGNORE INTO playlist_entries (station_id, song_id, added_at) "
+            "VALUES (?, ?, ?)",
+            (row["station_id"], song_id, db.now()),
+        )
+
+
+async def match_song(song: dict[str, Any]) -> str:
+    db.execute(
+        "UPDATE songs SET attempts = attempts + 1, last_attempt_at = ? WHERE id = ?",
+        (db.now(), song["id"]),
+    )
+    result = await matcher.resolve(
+        song["raw_artist"], song["raw_title"], song["raw_album"], song["duration"]
+    )
+
+    if result.status == "nonsong":
+        db.execute(
+            "UPDATE songs SET status = 'nonsong', nonsong_reason = ?, confidence = 0, "
+            "match_method = ?, resolved_at = ? WHERE id = ?",
+            (result.reason, result.method, db.now(), song["id"]),
+        )
+        return "nonsong"
+
+    if result.candidates:
+        _store_candidates(int(song["id"]), result.candidates)
+
+    if result.best is None:
+        # A provider outage must not harden into a permanent "not found": leave
+        # the song pending so the backoff query picks it up again later.
+        if result.retryable and int(song["attempts"]) < MAX_RETRY_ATTEMPTS:
+            db.execute(
+                "UPDATE songs SET status = 'pending', nonsong_reason = ? WHERE id = ?",
+                (f"Retrying — {result.reason}"[:500], song["id"]),
+            )
+            return "retry"
+        db.execute(
+            "UPDATE songs SET status = ?, confidence = 0, match_method = ?, "
+            "nonsong_reason = ? WHERE id = ?",
+            (result.status, result.method, result.reason[:500], song["id"]),
+        )
+        return result.status
+
+    best = result.best
+    if result.status == "matched":
+        # A playlist needs something playable, so try to attach a Spotify URI
+        # to identifications that came from MusicBrainz alone.
+        best = await matcher.enrich_with_spotify(
+            best, song["raw_artist"], song["raw_title"], song["duration"]
+        )
+
+    apply_match(int(song["id"]), best, result.status, result.confidence, result.method)
+
+    if result.status == "matched":
+        enqueue_for_playlists(int(song["id"]))
+    return result.status
+
+
+async def match_pending(limit: int = MATCH_BATCH) -> dict[str, int]:
+    # Escalating backoff keeps a retrying song from monopolising the loop while
+    # a provider is down, without ever dropping it.
+    songs = [dict(r) for r in db.query(
+        "SELECT * FROM songs WHERE status = 'pending' "
+        "AND (last_attempt_at IS NULL OR last_attempt_at <= ?) "
+        "ORDER BY play_count DESC, last_seen_at DESC LIMIT ?",
+        (db.now() - RETRY_BACKOFF_SECONDS, limit)
+    )]
+    if not songs:
+        return {}
+
+    _state["matching"] = True
+    counts: dict[str, int] = {}
+    try:
+        for song in songs:
+            try:
+                status = await match_song(song)
+            except Exception as exc:  # noqa: BLE001 - one bad song must not stop the queue
+                db.log_event(
+                    f"Match failed for {song['raw_artist']} - {song['raw_title']}: {exc}",
+                    level="error", source="match",
+                )
+                # Leave it pending but recorded; attempts stops it spinning forever.
+                if int(song["attempts"]) >= 4:
+                    db.execute(
+                        "UPDATE songs SET status = 'unmatched', nonsong_reason = ? WHERE id = ?",
+                        (f"Repeated errors: {exc}"[:500], song["id"]),
+                    )
+                status = "error"
+            counts[status] = counts.get(status, 0) + 1
+    finally:
+        _state["matching"] = False
+    return counts
+
+
+# --- loops -------------------------------------------------------------------
+
+async def _poll_loop() -> None:
+    while True:
+        try:
+            await poll_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            db.log_event(f"Poll loop error: {exc}", level="error", source="poll")
+        await asyncio.sleep(max(15, db.get_int("poll_interval_seconds", 45)))
+
+
+async def _match_loop() -> None:
+    while True:
+        try:
+            counts = await match_pending()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            db.log_event(f"Match loop error: {exc}", level="error", source="match")
+            counts = {}
+        # Drain quickly while there is a backlog, idle politely when there is not.
+        await asyncio.sleep(2 if counts else 20)
+
+
+async def _sync_loop() -> None:
+    while True:
+        try:
+            await playlists.sync_all()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            db.log_event(f"Playlist sync error: {exc}", level="error", source="sync")
+        await asyncio.sleep(120)
+
+
+def start() -> None:
+    if _tasks:
+        return
+    loop = asyncio.get_event_loop()
+    _tasks.extend([
+        loop.create_task(_poll_loop(), name="poll"),
+        loop.create_task(_match_loop(), name="match"),
+        loop.create_task(_sync_loop(), name="sync"),
+    ])
+
+
+async def stop() -> None:
+    for task in _tasks:
+        task.cancel()
+    for task in _tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    _tasks.clear()
+    await sources.aclose()
+
+
+def state() -> dict[str, Any]:
+    return dict(_state)

@@ -1,0 +1,278 @@
+"""SQLite access layer.
+
+Single-writer WAL database. Everything the app knows lives here so the whole
+container state is one file the user can back up from /config.
+
+Entity model
+------------
+stations         a monitored stream
+plays            append-only log of every observed play (history + stats)
+songs            one row per distinct piece of stream metadata; the thing that
+                 gets matched, reviewed and eventually added to a playlist
+candidates       ranked provider results attached to a song, for the review UI
+aliases          learned normalized-key -> confirmed identity, so a track the
+                 user resolves once is auto-matched forever after
+playlist_entries song membership in a station playlist + per-target sync state
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+from . import config
+
+_local = threading.local()
+_write_lock = threading.Lock()
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS stations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug                TEXT NOT NULL UNIQUE,
+    name                TEXT NOT NULL,
+    holiday             TEXT NOT NULL DEFAULT 'halloween',
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    -- Preferred source: AzuraCast JSON API (rich, includes history + duration)
+    azuracast_base      TEXT,
+    azuracast_shortcode TEXT,
+    -- Fallback source: raw Icecast/SHOUTcast mount with ICY metadata
+    icy_url             TEXT,
+    spotify_playlist_id TEXT,
+    m3u_filename        TEXT,
+    last_polled_at      INTEGER,
+    last_error          TEXT,
+    created_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS songs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Stable identity for a piece of stream metadata. AzuraCast gives us a hash;
+    -- otherwise we derive one from the normalized artist/title.
+    fingerprint     TEXT NOT NULL UNIQUE,
+    raw_artist      TEXT NOT NULL DEFAULT '',
+    raw_title       TEXT NOT NULL DEFAULT '',
+    raw_album       TEXT NOT NULL DEFAULT '',
+    norm_artist     TEXT NOT NULL DEFAULT '',
+    norm_title      TEXT NOT NULL DEFAULT '',
+    duration        INTEGER,
+    art_url         TEXT,
+    -- pending | matched | review | unmatched | confirmed | rejected | nonsong
+    status          TEXT NOT NULL DEFAULT 'pending',
+    confidence      REAL NOT NULL DEFAULT 0,
+    match_method    TEXT,
+    -- Resolved identity
+    match_artist    TEXT,
+    match_title     TEXT,
+    match_album     TEXT,
+    match_duration  INTEGER,
+    mbid            TEXT,
+    isrc            TEXT,
+    spotify_id      TEXT,
+    spotify_uri     TEXT,
+    spotify_url     TEXT,
+    match_art_url   TEXT,
+    nonsong_reason  TEXT,
+    play_count      INTEGER NOT NULL DEFAULT 0,
+    first_seen_at   INTEGER NOT NULL,
+    last_seen_at    INTEGER NOT NULL,
+    resolved_at     INTEGER,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_songs_status ON songs(status);
+CREATE INDEX IF NOT EXISTS idx_songs_last_seen ON songs(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_songs_normkey ON songs(norm_artist, norm_title);
+
+CREATE TABLE IF NOT EXISTS plays (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id  INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+    song_id     INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+    played_at   INTEGER NOT NULL,
+    UNIQUE(station_id, song_id, played_at)
+);
+CREATE INDEX IF NOT EXISTS idx_plays_played ON plays(played_at DESC);
+CREATE INDEX IF NOT EXISTS idx_plays_station ON plays(station_id, played_at DESC);
+
+CREATE TABLE IF NOT EXISTS candidates (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_id       INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+    source        TEXT NOT NULL,          -- musicbrainz | spotify
+    ext_id        TEXT NOT NULL,
+    artist        TEXT NOT NULL DEFAULT '',
+    title         TEXT NOT NULL DEFAULT '',
+    album         TEXT NOT NULL DEFAULT '',
+    duration      INTEGER,
+    art_url       TEXT,
+    url           TEXT,
+    uri           TEXT,
+    isrc          TEXT,
+    score         REAL NOT NULL DEFAULT 0,
+    score_detail  TEXT,
+    rank          INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    UNIQUE(song_id, source, ext_id)
+);
+CREATE INDEX IF NOT EXISTS idx_candidates_song ON candidates(song_id, score DESC);
+
+CREATE TABLE IF NOT EXISTS aliases (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_artist   TEXT NOT NULL,
+    key_title    TEXT NOT NULL,
+    match_artist TEXT,
+    match_title  TEXT,
+    match_album  TEXT,
+    duration     INTEGER,
+    mbid         TEXT,
+    isrc         TEXT,
+    spotify_id   TEXT,
+    spotify_uri  TEXT,
+    spotify_url  TEXT,
+    art_url      TEXT,
+    -- 'nonsong' aliases teach the filter that this metadata is never a song
+    kind         TEXT NOT NULL DEFAULT 'match',
+    hits         INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    UNIQUE(key_artist, key_title)
+);
+
+CREATE TABLE IF NOT EXISTS playlist_entries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id     INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+    song_id        INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+    added_at       INTEGER NOT NULL,
+    spotify_synced INTEGER NOT NULL DEFAULT 0,
+    m3u_synced     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(station_id, song_id)
+);
+CREATE INDEX IF NOT EXISTS idx_entries_station ON playlist_entries(station_id, added_at DESC);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    level      TEXT NOT NULL DEFAULT 'info',
+    source     TEXT NOT NULL DEFAULT '',
+    message    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
+"""
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def connect() -> sqlite3.Connection:
+    """Per-thread connection. FastAPI's threadpool reuses threads, so this is cheap."""
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(config.DB_PATH, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        _local.conn = conn
+    return conn
+
+
+def init_db() -> None:
+    conn = connect()
+    with _write_lock:
+        conn.executescript(SCHEMA)
+        for key, value in config.DEFAULT_SETTINGS.items():
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
+        conn.commit()
+
+
+def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    return connect().execute(sql, tuple(params)).fetchall()
+
+
+def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
+    return connect().execute(sql, tuple(params)).fetchone()
+
+
+def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
+    conn = connect()
+    with _write_lock:
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        return cur
+
+
+def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
+    conn = connect()
+    with _write_lock:
+        conn.executemany(sql, [tuple(p) for p in seq])
+        conn.commit()
+
+
+# --- settings ---------------------------------------------------------------
+
+def get_setting(key: str, default: str = "") -> str:
+    row = query_one("SELECT value FROM settings WHERE key = ?", (key,))
+    if row is None:
+        return config.DEFAULT_SETTINGS.get(key, default)
+    return row["value"]
+
+
+def get_float(key: str, default: float) -> float:
+    try:
+        return float(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_int(key: str, default: int) -> int:
+    try:
+        return int(float(get_setting(key, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_bool(key: str, default: bool = False) -> bool:
+    return get_setting(key, "1" if default else "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_setting(key: str, value: str) -> None:
+    execute(
+        "INSERT INTO settings(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+
+
+def all_settings() -> dict[str, str]:
+    merged = dict(config.DEFAULT_SETTINGS)
+    for row in query("SELECT key, value FROM settings"):
+        merged[row["key"]] = row["value"]
+    return merged
+
+
+# --- events -----------------------------------------------------------------
+
+def log_event(message: str, level: str = "info", source: str = "") -> None:
+    execute(
+        "INSERT INTO events(level, source, message, created_at) VALUES(?, ?, ?, ?)",
+        (level, source, message[:2000], now()),
+    )
+    # Keep the log bounded; this is a diagnostic tail, not an archive.
+    execute(
+        "DELETE FROM events WHERE id < (SELECT MAX(id) - 500 FROM events)"
+    )
+
+
+def db_path() -> Path:
+    return config.DB_PATH

@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Holiday-Radio-Monitor</Name>
+  <Repository>ghcr.io/tronvondoom/holiday-radio-monitor:latest</Repository>
+  <Registry>https://github.com/TronVonDoom/Holiday-Radio-Monitor/pkgs/container/holiday-radio-monitor</Registry>
+  <Branch>
+    <Tag/>
+    <TagDescription/>
+  </Branch>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/TronVonDoom/Holiday-Radio-Monitor/issues</Support>
+  <Project>https://github.com/TronVonDoom/Holiday-Radio-Monitor</Project>
+  <Overview>
+    Monitors holiday radio streams (Halloween, Christmas and anything else you add),
+    identifies every song that airs, and builds playlists from them.
+
+    Songs are matched against MusicBrainz and Spotify using artist, title and
+    track-length agreement. Confident matches are added to a Spotify playlist and
+    written to .m3u8 files automatically. Anything the matcher is unsure about is
+    held in a review queue so you can pick the right track yourself &#8212; and every
+    choice you make is remembered, so that song matches instantly forever after.
+
+    Station jingles and IDs are detected and filtered out so they never reach a playlist.
+
+    Point it at any AzuraCast, Icecast or SHOUTcast stream. The Stations tab can
+    discover every station on an AzuraCast server and add them in one click.
+  </Overview>
+  <Category>MediaApp:Music Tools:Utilities Status:Stable</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/TronVonDoom/Holiday-Radio-Monitor/main/unraid/holiday-radio-matcher.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/TronVonDoom/Holiday-Radio-Monitor/main/app/web/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <Config Name="WebUI Port"
+          Target="8080"
+          Default="8080"
+          Mode="tcp"
+          Description="Port for the web interface. The WebUI button opens this."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">8080</Config>
+
+  <Config Name="Config Storage"
+          Target="/config"
+          Default="/mnt/user/appdata/holiday-radio-matcher"
+          Mode="rw"
+          Description="Database, settings and your Spotify link live here. Back this folder up."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/holiday-radio-matcher</Config>
+
+  <Config Name="Playlists Folder"
+          Target="/playlists"
+          Default="/mnt/user/music/playlists"
+          Mode="rw"
+          Description="Where generated .m3u8 playlist files are written. Point this at a share your music player can read."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/music/playlists</Config>
+
+  <Config Name="Timezone"
+          Target="TZ"
+          Default="America/New_York"
+          Mode=""
+          Description="Timezone used for timestamps in the interface."
+          Type="Variable"
+          Display="always"
+          Required="false"
+          Mask="false">America/New_York</Config>
+
+  <Config Name="Access Token"
+          Target="HRM_AUTH_TOKEN"
+          Default=""
+          Mode=""
+          Description="Optional. Set a value to require this token before the interface opens. Leave blank for open access on your LAN."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="true"/>
+
+  <Config Name="Spotify Redirect URI"
+          Target="HRM_SPOTIFY_REDIRECT_URI"
+          Default=""
+          Mode=""
+          Description="Optional override. Only needed if you reach the app through a reverse proxy - set it to https://your.domain/api/spotify/callback and add the same value to your Spotify app settings."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false"/>
+</Container>
