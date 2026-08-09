@@ -92,7 +92,11 @@ def authorize_url(redirect_uri: str, state: str) -> str:
         "redirect_uri": redirect_uri,
         "scope": SCOPES,
         "state": state,
-        "show_dialog": "false",
+        # Force the consent screen. Silent re-authorization against a stale or
+        # multi-account browser session is a reported source of Spotify
+        # returning "server_error", and linking happens once, so always showing
+        # the account chooser is the more reliable behaviour here.
+        "show_dialog": "true",
     }
     return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
