@@ -446,7 +446,7 @@ async function renderSettings() {
   const data = await api("/settings");
   const v = data.values;
   const sp = data.spotify;
-  const redirect = (await api("/spotify/redirect-uri")).redirect_uri;
+  const redirect = await api("/spotify/redirect-uri");
 
   $("#view-settings").innerHTML = `
     <div class="grid two">
@@ -500,8 +500,14 @@ async function renderSettings() {
             <input type="text" id="s-cid" value="${esc(v.spotify_client_id)}"></div>
           <div class="field"><label>Client secret</label>
             <input type="password" id="s-csec" value="${esc(v.spotify_client_secret)}"></div>
-          <div class="field"><label>Redirect URI (paste this into your Spotify app)</label>
-            <input type="text" id="s-redir" value="${esc(redirect)}" readonly onclick="this.select()"></div>
+          <div class="field"><label>Redirect URI — must match your Spotify app exactly</label>
+            <input type="text" id="s-redir" value="${esc(redirect.redirect_uri)}" onclick="this.select()">
+            ${redirect.warning
+              ? `<span class="hint" style="color:var(--warn)">⚠ ${esc(redirect.warning)}</span>
+                 <button class="btn ghost sm" id="sp-use-loopback" style="margin-top:.4rem;align-self:start">
+                   Use ${esc(redirect.suggested_loopback)}</button>`
+              : `<span class="hint" style="color:var(--ok)">✓ Spotify accepts this form.</span>`}
+          </div>
           <div class="row" style="margin-top:.4rem">
             ${sp.linked
               ? `<span class="badge matched">Connected as ${esc(sp.user || "user")}</span>
@@ -511,6 +517,20 @@ async function renderSettings() {
           ${!sp.configured ? `<div class="muted" style="margin-top:.5rem">
             Create a free app at <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com</a>,
             then paste the ID and secret above and save.</div>` : ""}
+          ${!sp.linked && sp.configured ? `
+          <div style="margin-top:.9rem;padding-top:.9rem;border-top:1px solid var(--line)">
+            <label style="font-size:.8rem;color:var(--text-dim);font-weight:600">
+              Finish linking by pasting the URL you landed on</label>
+            <p class="hint" style="margin:.25rem 0 .5rem">
+              After approving, your browser lands on the redirect address. If the page
+              fails to load, that is expected — copy the whole address from the bar and
+              paste it here.</p>
+            <div class="row">
+              <div class="field" style="margin-bottom:0">
+                <input type="text" id="sp-paste" placeholder="http://127.0.0.1:8686/api/spotify/callback?code=..."></div>
+              <button class="btn" id="sp-exchange">Finish</button>
+            </div>
+          </div>` : ""}
         </div>
 
         <div class="card">
@@ -585,7 +605,7 @@ document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-reject],[data-nonsong],[data-rematch]," +
     "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station]," +
     "#btn-refresh,#btn-sync,#rv-prev,#rv-skip,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
-    "#sp-link,#sp-unlink,#lib-prev,#lib-next");
+    "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#lib-prev,#lib-next");
   if (!t) return;
 
   const d = t.dataset;
@@ -742,11 +762,31 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
+  if (t.id === "sp-use-loopback") {
+    const { suggested_loopback } = await api("/spotify/redirect-uri");
+    await api("/settings", { method: "PUT", body: { values: { spotify_redirect_uri: suggested_loopback } } });
+    toast("Redirect URI set — add the same value in your Spotify app", "ok");
+    return renderSettings();
+  }
+
   if (t.id === "sp-link") {
     try {
-      const { url } = await api("/spotify/login");
-      location.href = url;
+      const { url, warning } = await api("/spotify/login");
+      if (warning && !confirm(`${warning}\n\nOpen Spotify anyway?`)) return;
+      // Opened in a new tab so this page stays put to receive the pasted URL.
+      window.open(url, "_blank", "noopener");
+      toast("Approve in the new tab, then paste the address you land on", "ok");
     } catch (e) { toast(e.message, "bad"); }
+    return;
+  }
+
+  if (t.id === "sp-exchange") {
+    t.disabled = true; t.textContent = "Linking…";
+    try {
+      const res = await api("/spotify/exchange", { method: "POST", body: { value: $("#sp-paste").value } });
+      toast(`Spotify connected as ${res.user || "user"}`, "ok");
+      return renderSettings();
+    } catch (e) { toast(e.message, "bad"); t.disabled = false; t.textContent = "Finish"; }
     return;
   }
   if (t.id === "sp-unlink") {

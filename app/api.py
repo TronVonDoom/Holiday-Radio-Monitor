@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -72,6 +73,11 @@ class SearchIn(BaseModel):
 
 class SettingsIn(BaseModel):
     values: dict[str, str]
+
+
+class ExchangeIn(BaseModel):
+    """Either the full pasted callback URL, or just the bare code."""
+    value: str
 
 
 # --- helpers -----------------------------------------------------------------
@@ -529,42 +535,113 @@ def put_settings(payload: SettingsIn) -> dict[str, Any]:
 def _redirect_uri(request: Request) -> str:
     """Where Spotify sends the user back after they approve access.
 
-    Behind a reverse proxy the container cannot infer the public URL, so an
-    explicit override (env var, or the Settings field) wins when present.
+    Spotify rejects anything that is not HTTPS or a literal loopback address, so
+    the auto-derived LAN URL (http://192.168.x.x:8686/...) is refused with
+    "redirect_uri: Insecure". The Settings field is checked first so the fix is
+    always reachable from the UI, even when the env var was set to a bad value.
     """
-    if config.SPOTIFY_REDIRECT_URI:
-        return config.SPOTIFY_REDIRECT_URI
     override = db.get_setting("spotify_redirect_uri", "").strip()
     if override:
         return override
+    if config.SPOTIFY_REDIRECT_URI:
+        return config.SPOTIFY_REDIRECT_URI
     return str(request.url_for("spotify_callback"))
+
+
+def check_redirect_uri(uri: str) -> str:
+    """Return a warning if Spotify will reject this redirect URI, else ''."""
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return ""
+    if host in ("127.0.0.1", "::1") and parsed.scheme == "http":
+        return ""
+    if host == "localhost":
+        return ("Spotify does not accept 'localhost'. Use 127.0.0.1 instead, "
+                "or an https:// address.")
+    return ("Spotify only accepts https:// addresses or the literal loopback "
+            "address 127.0.0.1 — a plain http:// LAN address is rejected with "
+            "\"redirect_uri: Insecure\".")
 
 
 @router.get("/spotify/login")
 def spotify_login(request: Request) -> Any:
     if not spotify.is_configured():
         raise HTTPException(400, "Set the Spotify client ID and secret first.")
+    redirect_uri = _redirect_uri(request)
     state = secrets.token_urlsafe(16)
     db.set_setting("spotify_oauth_state", state)
-    return {"url": spotify.authorize_url(_redirect_uri(request), state),
-            "redirect_uri": _redirect_uri(request)}
+    # The token exchange must present the identical redirect URI, so remember
+    # exactly which one this authorization used.
+    db.set_setting("spotify_oauth_redirect", redirect_uri)
+    return {
+        "url": spotify.authorize_url(redirect_uri, state),
+        "redirect_uri": redirect_uri,
+        "warning": check_redirect_uri(redirect_uri),
+    }
+
+
+async def _finish_link(code: str, state: str, redirect_uri: str) -> None:
+    expected = db.get_setting("spotify_oauth_state", "")
+    if not code:
+        raise HTTPException(400, "No authorization code was found.")
+    if expected and state and state != expected:
+        raise HTTPException(400, "Authorization state did not match. Start the link again.")
+    await spotify.exchange_code(code, redirect_uri)
+    db.set_setting("spotify_oauth_state", "")
+    db.log_event("Spotify account connected", source="spotify")
 
 
 @router.get("/spotify/callback", name="spotify_callback")
 async def spotify_callback(request: Request, code: str = "", state: str = "",
                            error: str = "") -> Any:
+    """Hit directly when the browser can actually reach this app's callback."""
     if error:
         return RedirectResponse(f"/?spotify=error&reason={error}")
-    expected = db.get_setting("spotify_oauth_state", "")
-    if not code or not state or state != expected:
-        return RedirectResponse("/?spotify=error&reason=state_mismatch")
-    db.set_setting("spotify_oauth_state", "")
+    redirect_uri = db.get_setting("spotify_oauth_redirect", "") or _redirect_uri(request)
     try:
-        await spotify.exchange_code(code, _redirect_uri(request))
+        await _finish_link(code, state, redirect_uri)
+    except HTTPException as exc:
+        return RedirectResponse(f"/?spotify=error&reason={exc.detail}")
     except Exception as exc:  # noqa: BLE001
         return RedirectResponse(f"/?spotify=error&reason={str(exc)[:120]}")
-    db.log_event("Spotify account connected", source="spotify")
     return RedirectResponse("/?spotify=linked")
+
+
+@router.post("/spotify/exchange")
+async def spotify_exchange(payload: ExchangeIn) -> dict[str, Any]:
+    """Complete the link from a pasted callback URL.
+
+    Spotify requires a loopback or https redirect, which usually cannot reach a
+    container on another machine. Letting that redirect fail and pasting the
+    resulting address back here avoids needing a tunnel or a reverse proxy.
+    """
+    raw = payload.value.strip()
+    if not raw:
+        raise HTTPException(400, "Paste the URL you were redirected to.")
+
+    code, state = raw, ""
+    if "://" in raw or raw.startswith("?") or "code=" in raw:
+        query = urlparse(raw).query or raw.lstrip("?")
+        params = parse_qs(query)
+        if params.get("error"):
+            raise HTTPException(400, f"Spotify returned an error: {params['error'][0]}")
+        if not params.get("code"):
+            raise HTTPException(400, "That URL has no 'code' parameter in it.")
+        code = params["code"][0]
+        state = (params.get("state") or [""])[0]
+
+    redirect_uri = db.get_setting("spotify_oauth_redirect", "").strip()
+    if not redirect_uri:
+        raise HTTPException(400, "Start the link with 'Connect Spotify account' first.")
+
+    try:
+        await _finish_link(code, state, redirect_uri)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface Spotify's own wording
+        raise HTTPException(400, f"Spotify rejected the link: {str(exc)[:300]}") from exc
+    return {"status": "linked", "user": db.get_setting("spotify_user_name", "")}
 
 
 @router.post("/spotify/unlink")
@@ -575,7 +652,15 @@ def spotify_unlink() -> dict[str, str]:
 
 @router.get("/spotify/redirect-uri")
 def spotify_redirect_uri(request: Request) -> dict[str, str]:
-    return {"redirect_uri": _redirect_uri(request)}
+    uri = _redirect_uri(request)
+    return {"redirect_uri": uri, "warning": check_redirect_uri(uri),
+            "suggested_loopback": _suggested_loopback(request)}
+
+
+def _suggested_loopback(request: Request) -> str:
+    """A ready-made loopback URI on the port this app is actually served on."""
+    port = request.url.port or config.PORT
+    return f"http://127.0.0.1:{port}/api/spotify/callback"
 
 
 # --- aliases -----------------------------------------------------------------
