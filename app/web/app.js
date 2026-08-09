@@ -187,11 +187,16 @@ async function renderDashboard() {
   const c = stats.counts;
   const resolved = c.matched + c.confirmed;
   const rate = Math.round(stats.match_rate * 100);
+  const mb = stats.musicbrainz;
 
   const tiles = [
     { label: "Matched", value: resolved, foot: `${rate}% of resolved songs`, bar: rate },
     { label: "Needs review", value: c.review + c.unmatched, foot: "waiting on you" },
-    { label: "In queue", value: c.pending, foot: stats.worker.matching ? "matching now…" : "idle" },
+    // A MusicBrainz cooldown is the one thing that makes a busy-looking queue
+    // stop draining, so it outranks "matching now…" here.
+    { label: "In queue", value: c.pending, foot: mb && mb.throttled
+        ? `MusicBrainz paused ${Math.ceil(mb.cooldown_seconds)}s`
+        : stats.worker.matching ? "matching now…" : "idle" },
     { label: "Playlist tracks", value: stats.playlist_entries, foot: `${stats.stations} station(s)` },
     { label: "Learned rules", value: stats.aliases, foot: "auto-match forever" },
     { label: "Filtered", value: c.nonsong, foot: "jingles & station IDs" },
@@ -568,6 +573,13 @@ async function renderSettings() {
               <input type="text" id="s-market" value="${esc(v.spotify_market)}" maxlength="2"></div>
           </div>
           <div class="row">
+            <div class="field"><label>MusicBrainz cooldown (seconds)</label>
+              <input type="number" id="s-mbcool" value="${esc(v.musicbrainz_cooldown_seconds)}">
+              <span class="hint">How long to stop calling MusicBrainz after it asks us to
+                slow down. Escalates to 3×, 10× and 30× if throttling continues; matching
+                falls back to Spotify meanwhile.</span></div>
+          </div>
+          <div class="row">
             <label class="switch"><input type="checkbox" id="s-m3u" ${v.m3u_enabled === "1" ? "checked" : ""}> Write .m3u8 files</label>
             <label class="switch"><input type="checkbox" id="s-spsync" ${v.spotify_sync_enabled === "1" ? "checked" : ""}> Sync to Spotify</label>
           </div>
@@ -662,7 +674,9 @@ function applyStats(stats) {
   const worker = $("#worker-state");
   const busy = stats.worker.polling || stats.worker.matching;
   worker.classList.toggle("busy", !!busy);
-  worker.lastElementChild.textContent = stats.worker.matching ? "Matching…"
+  const throttled = stats.musicbrainz && stats.musicbrainz.throttled;
+  worker.lastElementChild.textContent = throttled ? "MusicBrainz paused"
+    : stats.worker.matching ? "Matching…"
     : stats.worker.polling ? "Polling…" : "Idle";
   $("#app-version").textContent = `v${stats.version}`;
 }
@@ -929,6 +943,7 @@ document.addEventListener("click", async (ev) => {
       review_floor_score: $("#s-floor").value,
       min_song_seconds: $("#s-minlen").value,
       poll_interval_seconds: $("#s-poll").value,
+      musicbrainz_cooldown_seconds: $("#s-mbcool").value,
       spotify_market: $("#s-market").value.toUpperCase(),
       use_musicbrainz: $("#s-mb").checked ? "1" : "0",
       use_spotify: $("#s-sp").checked ? "1" : "0",

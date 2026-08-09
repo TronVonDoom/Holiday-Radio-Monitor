@@ -28,6 +28,12 @@ MATCH_BATCH = 8
 MAX_RETRY_ATTEMPTS = 6
 RETRY_BACKOFF_SECONDS = 90
 
+# Hard ceiling on one song. The matcher is deliberately serial to stay inside
+# MusicBrainz's rate budget, which means a single slow resolve blocks the whole
+# queue - so no song is ever allowed to hold the loop indefinitely. A healthy
+# resolve is a few seconds; this only fires when a provider is misbehaving.
+MATCH_SONG_TIMEOUT = 90
+
 _tasks: list[asyncio.Task] = []
 _state: dict[str, Any] = {"polling": False, "matching": False, "last_poll": 0}
 
@@ -35,6 +41,13 @@ _state: dict[str, Any] = {"polling": False, "matching": False, "last_poll": 0}
 # --- ingestion ---------------------------------------------------------------
 
 def _upsert_song(obs: sources.Observation) -> int:
+    """Record the metadata for an observation, without counting it as a play.
+
+    AzuraCast returns a rolling history window, so the same play is observed on
+    every poll. Only `ingest` knows whether an observation became a new row in
+    `plays`, so only `ingest` may touch `play_count` - counting here inflated it
+    by roughly the number of times a play stayed inside the history window.
+    """
     fp = fingerprint(obs.artist, obs.title, obs.external_id)
     album = "" if is_junk_album(obs.album) else obs.album
     now = db.now()
@@ -42,7 +55,7 @@ def _upsert_song(obs: sources.Observation) -> int:
     row = db.query_one("SELECT id, duration, art_url FROM songs WHERE fingerprint = ?", (fp,))
     if row is not None:
         db.execute(
-            "UPDATE songs SET last_seen_at = ?, play_count = play_count + 1, "
+            "UPDATE songs SET last_seen_at = ?, "
             "duration = COALESCE(?, duration), art_url = COALESCE(NULLIF(?, ''), art_url) "
             "WHERE id = ?",
             (now, obs.duration, obs.art_url, row["id"]),
@@ -52,7 +65,7 @@ def _upsert_song(obs: sources.Observation) -> int:
     cur = db.execute(
         "INSERT INTO songs (fingerprint, raw_artist, raw_title, raw_album, norm_artist, "
         "norm_title, duration, art_url, status, play_count, first_seen_at, last_seen_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)",
         (fp, obs.artist, obs.title, album, norm_key(obs.artist), norm_key(obs.title),
          obs.duration, obs.art_url, now, now),
     )
@@ -89,6 +102,11 @@ def ingest(station_id: int, observations: list[sources.Observation]) -> int:
         if cur.rowcount:
             new_plays += 1
             last_song_id = song_id
+            # play_count is a cache of COUNT(*) over `plays`, so it is only ever
+            # bumped alongside a row that actually landed.
+            db.execute(
+                "UPDATE songs SET play_count = play_count + 1 WHERE id = ?", (song_id,)
+            )
 
     return new_plays
 
@@ -253,7 +271,29 @@ async def match_pending(limit: int = MATCH_BATCH) -> dict[str, int]:
     try:
         for song in songs:
             try:
-                status = await match_song(song)
+                status = await asyncio.wait_for(match_song(song), MATCH_SONG_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError):
+                # match_song already counted this attempt, so the song still ages
+                # out through MAX_RETRY_ATTEMPTS instead of retrying forever.
+                db.log_event(
+                    f"Match timed out after {MATCH_SONG_TIMEOUT}s for "
+                    f"{song['raw_artist']} - {song['raw_title']}; leaving it queued",
+                    level="warn", source="match",
+                )
+                attempts = int(song["attempts"]) + 1
+                if attempts >= MAX_RETRY_ATTEMPTS:
+                    db.execute(
+                        "UPDATE songs SET status = 'unmatched', nonsong_reason = ? "
+                        "WHERE id = ?",
+                        (f"Timed out after {attempts} attempts", song["id"]),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE songs SET status = 'pending', nonsong_reason = ? "
+                        "WHERE id = ?",
+                        (f"Retrying — timed out after {MATCH_SONG_TIMEOUT}s", song["id"]),
+                    )
+                status = "timeout"
             except Exception as exc:  # noqa: BLE001 - one bad song must not stop the queue
                 db.log_event(
                     f"Match failed for {song['raw_artist']} - {song['raw_title']}: {exc}",

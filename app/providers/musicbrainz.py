@@ -3,12 +3,25 @@
 MusicBrainz is the canonical-identity layer: it is free, needs no credentials,
 and returns stable MBIDs. Its rate limit is one request per second per client,
 which we honour with a global async lock rather than by sleeping optimistically.
+
+Spacing alone is not enough, though. The /ws/2 search endpoint is defended more
+aggressively than a plain lookup, and a station monitor that keeps the matcher
+busy will sit at the full one-per-second budget for hours. When MusicBrainz
+eventually pushes back with a 503, retrying each spelling in turn keeps sending
+requests at full rate to a service that just said no - which is both rude and
+self-defeating, because it turns a throttle into a ten-minute stall per song.
+
+So backpressure short-circuits the whole provider: a 503 or 429 opens a
+cooldown, every caller is refused locally without a request until it expires,
+and matching degrades to Spotify-only instead of grinding to a halt.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -18,13 +31,40 @@ from ..normalize import artist_variants, title_variants
 
 API = "https://musicbrainz.org/ws/2/recording"
 
+# A native relevance score this high means MusicBrainz is confident it found the
+# recording, so the remaining spellings would only re-find the same one.
+STRONG_NATIVE_SCORE = 90
+
+# Escalating cooldown multipliers applied to `musicbrainz_cooldown_seconds`. A
+# one-off throttle costs a minute; a sustained block backs off to half an hour
+# rather than probing every minute forever.
+COOLDOWN_STEPS = (1, 3, 10, 30)
+
 
 class ProviderUnavailable(RuntimeError):
     """Raised when the service could not be reached, as opposed to finding nothing."""
 
+
+class ProviderThrottled(ProviderUnavailable):
+    """MusicBrainz asked us to slow down.
+
+    Callers must abandon the entire search rather than trying another spelling:
+    the next request would land on a service that has already refused this one.
+    """
+
+    def __init__(self, message: str, retry_in: float = 0.0) -> None:
+        super().__init__(message)
+        self.retry_in = retry_in
+
+
 _client: httpx.AsyncClient | None = None
 _rate_lock = asyncio.Lock()
 _last_request = 0.0
+
+# Circuit breaker state. `_throttle_streak` only resets on a successful request,
+# so repeated throttling escalates instead of settling into a probing loop.
+_cooldown_until = 0.0
+_throttle_streak = 0
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -44,17 +84,100 @@ async def aclose() -> None:
     _client = None
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Seconds to wait, from either Retry-After form. None when absent/unusable.
+
+    The header is a delta-seconds integer in practice, but the spec also allows
+    an HTTP-date, and the previous `.isdigit()` test silently discarded both a
+    date and a fractional value in favour of a much shorter guess.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def cooldown_remaining() -> float:
+    """Seconds until MusicBrainz may be called again. 0 when it is available."""
+    return max(0.0, _cooldown_until - time.monotonic())
+
+
+def status() -> dict[str, Any]:
+    """Breaker state, so a cold provider is visible instead of looking idle."""
+    remaining = cooldown_remaining()
+    return {
+        "throttled": remaining > 0,
+        "cooldown_seconds": round(remaining, 1),
+        "throttle_streak": _throttle_streak,
+    }
+
+
+def _open_breaker(retry_after: float | None) -> float:
+    """Record backpressure and refuse local calls until the cooldown expires."""
+    global _cooldown_until, _throttle_streak
+    _throttle_streak += 1
+    base = max(5.0, db.get_float("musicbrainz_cooldown_seconds", 60.0))
+    step = base * COOLDOWN_STEPS[min(_throttle_streak, len(COOLDOWN_STEPS)) - 1]
+    # Honour Retry-After in full when MusicBrainz names a delay, but never wait
+    # less than our own escalating floor.
+    delay = max(step, retry_after or 0.0)
+    _cooldown_until = max(_cooldown_until, time.monotonic() + delay)
+    db.log_event(
+        f"MusicBrainz asked us to back off; pausing lookups for {delay:.0f}s "
+        f"(consecutive throttles: {_throttle_streak}). Matching continues on "
+        "Spotify alone until then.",
+        level="warn", source="musicbrainz",
+    )
+    return delay
+
+
+def _close_breaker() -> None:
+    """A successful request means we are inside the budget again."""
+    global _throttle_streak, _cooldown_until
+    if _throttle_streak:
+        db.log_event("MusicBrainz is responding normally again.",
+                     level="info", source="musicbrainz")
+    _throttle_streak = 0
+    _cooldown_until = 0.0
+
+
 async def _throttled_get(params: dict[str, Any]) -> dict[str, Any] | None:
     """One request at a time, spaced by the configured minimum interval.
 
     Returns None only when the request genuinely failed. Callers must treat that
     differently from a successful search that found nothing, because loosening a
     query after a *failure* silently swaps a precise result set for a vague one.
+
+    Raises ProviderThrottled when MusicBrainz is pushing back - either because a
+    cooldown is already open (in which case no request is sent at all) or because
+    this response opened one.
     """
     global _last_request
+
+    remaining = cooldown_remaining()
+    if remaining > 0:
+        raise ProviderThrottled(
+            f"MusicBrainz is in cooldown for another {remaining:.0f}s", remaining
+        )
+
     interval = db.get_float("musicbrainz_rate_limit_seconds", 1.1)
 
-    for attempt in range(3):
+    # One retry, and only for a transport error. A refusal is never retried here:
+    # that is the breaker's job.
+    for attempt in range(2):
+        resp: httpx.Response | None = None
         async with _rate_lock:
             wait = interval - (time.monotonic() - _last_request)
             if wait > 0:
@@ -62,21 +185,26 @@ async def _throttled_get(params: dict[str, Any]) -> dict[str, Any] | None:
             try:
                 resp = await _get_client().get(API, params=params)
             except httpx.HTTPError:
-                _last_request = time.monotonic()
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
+                resp = None
             finally:
                 _last_request = time.monotonic()
 
+        if resp is None:
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+            return None
+
         if resp.status_code in (503, 429):
-            # Rate limited. Backing off and retrying preserves match quality;
-            # giving up here would quietly degrade it.
-            retry_after = resp.headers.get("Retry-After")
-            delay = float(retry_after) if (retry_after or "").isdigit() else 1.5 * (attempt + 1)
-            await asyncio.sleep(min(delay, 10.0))
-            continue
+            delay = _open_breaker(_parse_retry_after(resp.headers.get("Retry-After")))
+            raise ProviderThrottled(
+                f"MusicBrainz returned {resp.status_code}; backing off {delay:.0f}s",
+                delay,
+            )
         if resp.status_code != 200:
             return None
+
+        _close_breaker()
         try:
             return resp.json()
         except ValueError:
@@ -152,10 +280,12 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
     artists = artist_variants(artist) or [artist]
     titles = title_variants(title) or [title]
 
-    # Precise queries: every plausible artist spelling against every plausible
-    # title spelling, best guess first.
+    # Precise queries: plausible artist spellings against plausible title
+    # spellings, best guess first. Capped at 2x2 rather than 2x3 - every extra
+    # variant costs a full second of the shared rate budget, and the third
+    # artist form is a long shot that the title-only rescue below covers anyway.
     attempts: list[tuple[str, str]] = [
-        (a, t) for t in titles[:2] for a in artists[:3] if t
+        (a, t) for t in titles[:2] for a in artists[:2] if t
     ]
 
     seen_queries: set[str] = set()
@@ -167,17 +297,24 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
             continue
         seen_queries.add(query)
 
+        # ProviderThrottled propagates: once MusicBrainz has refused us, trying
+        # the next spelling would just be another refused request.
         data = await _throttled_get({"query": query, "fmt": "json", "limit": limit})
         if data is None:
             continue  # request failed; do NOT treat as "no such recording"
         any_success = True
+        strong = False
         for rec in data.get("recordings") or []:
             parsed = _parse_recording(rec)
             if parsed["ext_id"] and parsed["ext_id"] not in results:
                 results[parsed["ext_id"]] = parsed
+            if parsed["native_score"] >= STRONG_NATIVE_SCORE:
+                strong = True
 
-        # Enough signal to score confidently; stop spending rate limit.
-        if len(results) >= limit:
+        # Enough signal to score confidently; stop spending rate limit. A strong
+        # native hit on this spelling ends the search even when it returned only
+        # a couple of rows, which is the common case and the main volume saving.
+        if strong or len(results) >= limit:
             break
 
     # Title-only search rescues a badly mangled artist field, but it is
@@ -202,11 +339,17 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
 
 
 async def fetch_isrc(mbid: str) -> str:
-    """Direct recording lookup for the ISRC, used only as a scoring tie-break."""
+    """Direct recording lookup for the ISRC, used only as a scoring tie-break.
+
+    Returns "" on any failure. Being a tie-break, it is never worth waiting on a
+    cooldown for, so an open breaker skips the request entirely - and a refusal
+    here feeds the breaker like any other.
+    """
     global _last_request
-    if not mbid:
+    if not mbid or cooldown_remaining() > 0:
         return ""
     interval = db.get_float("musicbrainz_rate_limit_seconds", 1.1)
+    resp: httpx.Response | None = None
     async with _rate_lock:
         wait = interval - (time.monotonic() - _last_request)
         if wait > 0:
@@ -216,12 +359,18 @@ async def fetch_isrc(mbid: str) -> str:
                 f"{API}/{mbid}", params={"inc": "isrcs", "fmt": "json"}
             )
         except httpx.HTTPError:
-            return ""
+            resp = None
         finally:
             _last_request = time.monotonic()
 
+    if resp is None:
+        return ""
+    if resp.status_code in (503, 429):
+        _open_breaker(_parse_retry_after(resp.headers.get("Retry-After")))
+        return ""
     if resp.status_code != 200:
         return ""
+    _close_breaker()
     try:
         isrcs = resp.json().get("isrcs") or []
     except ValueError:

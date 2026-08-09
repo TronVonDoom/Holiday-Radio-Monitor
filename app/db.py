@@ -193,7 +193,34 @@ def init_db() -> None:
                 "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO NOTHING",
                 (key, value),
             )
+        _migrate(conn)
         conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """One-time data repairs. Called with `_write_lock` already held.
+
+    Must use `conn` directly: the module-level helpers take the same non-reentrant
+    lock and would deadlock.
+    """
+    done = {
+        row["key"] for row in
+        conn.execute("SELECT key FROM settings WHERE value = '1' AND key LIKE 'migrated_%'")
+    }
+
+    # play_count used to be incremented once per *observation*. Because AzuraCast
+    # serves a rolling history window, a single play was counted on every poll it
+    # remained visible for, inflating the figure roughly thirtyfold. Recompute it
+    # from `plays`, which was always deduplicated and is the real record.
+    if "migrated_play_count_from_plays" not in done:
+        conn.execute(
+            "UPDATE songs SET play_count = "
+            "(SELECT COUNT(*) FROM plays WHERE plays.song_id = songs.id)"
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('migrated_play_count_from_plays', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
 
 
 def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:

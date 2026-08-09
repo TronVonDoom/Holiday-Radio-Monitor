@@ -151,6 +151,7 @@ def stats() -> dict[str, Any]:
             "user": db.get_setting("spotify_user_name", ""),
         },
         "playlist_dir": playlists.playlist_dir_status(),
+        "musicbrainz": musicbrainz.status(),
         "version": config.APP_VERSION,
     }
 

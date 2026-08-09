@@ -50,11 +50,30 @@ real stream metadata is wrong. Every example below is live data from Halloween R
 | `JINGLE — Halloweenradio.net 20-1` (16s) | Rejected as station imaging before any lookup |
 | Karaoke and tribute re-recordings | Heavily penalised so they can never outrank the real thing |
 | Live bootlegs scoring identically on text | Penalised; studio releases preferred |
-| MusicBrainz rate-limiting mid-batch | Retried with backoff — **never** silently downgraded to a vague query |
+| MusicBrainz rate-limiting mid-batch | Lookups pause, matching continues on Spotify — **never** silently downgraded to a vague query |
 
 The last row matters more than it looks. A failed lookup and a genuine "no such
 song" are treated as completely different outcomes: a failure leaves the song
 queued for a later retry rather than being recorded as unmatched.
+
+### Staying inside MusicBrainz's rate limit
+
+MusicBrainz allows one request per second per client, and the search endpoint is
+defended more aggressively than a plain lookup. Three things keep this app a
+well-behaved citizen:
+
+- **Spacing.** A single global lock serialises every call and measures the gap
+  from the *end* of the previous request, so the real rate stays just under one
+  per second no matter how many stations are being monitored.
+- **A meaningful User-Agent**, with a contact URL, as their policy requires.
+- **Honouring backpressure.** A `503` or `429` opens a cooldown: no further
+  requests are sent until it expires, `Retry-After` is honoured in full, and
+  repeated throttling escalates the pause to 3×, 10× then 30× the configured
+  value. Matching degrades to Spotify-only rather than stalling, and the
+  dashboard says *MusicBrainz paused* while it lasts.
+
+Query volume is kept low for the same reason: a confident hit on the first
+spelling ends the search, so a recognisable song costs exactly one request.
 
 **Confidence scoring** blends title (0.42), artist (0.38) and duration (0.20)
 agreement. When a duration is unavailable the weight is redistributed rather
@@ -231,6 +250,16 @@ Environment variables (all optional — everything else is in the UI):
 
 Everything else — thresholds, poll interval, provider toggles, Spotify
 credentials — is editable in Settings without restarting.
+
+Two settings govern how the app treats MusicBrainz:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| MusicBrainz rate limit (seconds) | `1.1` | Minimum gap between requests |
+| MusicBrainz cooldown (seconds) | `60` | Pause after a `503`/`429`, escalating to 3×, 10×, 30× |
+
+Raising the cooldown is the right response to persistent throttling; lowering
+the rate limit below `1.0` is not, and will get the IP blocked.
 
 ---
 
