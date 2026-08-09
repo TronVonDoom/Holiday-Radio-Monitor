@@ -70,10 +70,26 @@ async function api(path, options = {}) {
 
 /* ---------- shared fragments ---------- */
 
+function placeholderEl(cls = "") {
+  const el = document.createElement("div");
+  el.className = `ph ${cls}`.trim();
+  el.innerHTML = icon("music", 18);
+  return el;
+}
+
+// No inline onerror here: the fallback markup is an SVG full of double quotes,
+// which would terminate the attribute and leak the remainder as visible text.
 const artwork = (url, cls = "") => url
-  ? `<img class="${cls}" src="${esc(url)}" alt="" loading="lazy"
-        onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'ph ${cls}',innerHTML:'${icon("music", 18).replace(/'/g, "&#39;")}'}))">`
-  : `<div class="ph ${cls}">${icon("music", 18)}</div>`;
+  ? `<img class="art ${esc(cls)}" src="${esc(url)}" alt="" loading="lazy">`
+  : `<div class="ph ${esc(cls)}">${icon("music", 18)}</div>`;
+
+// Image load failures do not bubble, so this listens in the capture phase.
+document.addEventListener("error", (ev) => {
+  const el = ev.target;
+  if (el instanceof HTMLImageElement && el.classList.contains("art")) {
+    el.replaceWith(placeholderEl([...el.classList].filter((c) => c !== "art").join(" ")));
+  }
+}, true);
 
 const statusBadge = (status) => `<span class="badge ${esc(status)}">${esc(status)}</span>`;
 
