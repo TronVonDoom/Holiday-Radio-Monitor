@@ -21,10 +21,24 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
+from .backoff import Breaker, parse_retry_after
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
+
+# Spotify enforces a rolling-window quota per application, so throttling follows
+# the matcher rather than the machine it runs on. Its 429 carries a Retry-After
+# that must be taken at face value: clamping it to a shorter wait simply earns
+# another 429, and retrying the same call four times over turns one refusal into
+# minutes of dead time. See backoff.Breaker for why this is a hard stop.
+_breaker = Breaker(
+    "Spotify", "spotify_cooldown_seconds",
+    fallback_note="Matching continues on MusicBrainz alone until then.",
+)
+
+# Total wall-clock one search may spend across all its query spellings.
+SEARCH_BUDGET = 20.0
 
 # user-library-modify is requested but not required: it is only used to tidy
 # away the playlist the access test creates. Asking for it does not invalidate
@@ -58,6 +72,29 @@ class SpotifyError(RuntimeError):
 
 class SpotifyAuthRequired(SpotifyError):
     """Raised when an operation needs a user login that has not happened yet."""
+
+
+class SpotifyThrottled(SpotifyError):
+    """Spotify asked us to slow down.
+
+    A subclass of SpotifyError so playlist delivery still reports it like any
+    other failure, but callers that loop over several queries must let it
+    through: the next call would only be refused as well.
+    """
+
+    def __init__(self, message: str, retry_in: float = 0.0) -> None:
+        super().__init__(message, status=429)
+        self.retry_in = retry_in
+
+
+def cooldown_remaining() -> float:
+    """Seconds until Spotify may be called again. 0 when it is available."""
+    return _breaker.remaining()
+
+
+def status() -> dict[str, Any]:
+    """Breaker state, so a cold provider is visible instead of looking idle."""
+    return _breaker.status()
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -272,18 +309,34 @@ def _error_text(resp: httpx.Response) -> str:
 
 async def _request(method: str, path: str, *, user: bool = False,
                    params: dict | None = None, json: Any = None) -> Any:
+    """Perform one Spotify call, honouring backpressure.
+
+    Raises SpotifyThrottled when Spotify is refusing us - either because a
+    cooldown is already open, in which case nothing is sent, or because this
+    response opened one. A 429 is never retried in place: the whole point of
+    Retry-After is that the next attempt would fail too.
+    """
+    remaining = _breaker.remaining()
+    if remaining > 0:
+        raise SpotifyThrottled(
+            f"Spotify is in cooldown for another {remaining:.0f}s", remaining
+        )
+
     url = path if path.startswith("http") else f"{API}{path}"
-    for attempt in range(4):
+    # Only a stale-token retry remains; everything else resolves on the first try.
+    for attempt in range(2):
         token = await _token(user)
         resp = await _get_client().request(
             method, url, params=params, json=json,
             headers={"Authorization": f"Bearer {token}"},
         )
         if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", "2") or 2)
-            await asyncio.sleep(min(retry_after, 30) + 0.25)
-            continue
-        if resp.status_code == 401 and attempt < 3:
+            delay = _breaker.open(parse_retry_after(resp.headers.get("Retry-After")))
+            raise SpotifyThrottled(
+                f"Spotify {method} {path} was rate limited; backing off {delay:.0f}s",
+                delay,
+            )
+        if resp.status_code == 401 and attempt == 0:
             global _user_token, _app_token
             _user_token = ("", 0.0)
             _app_token = ("", 0.0)
@@ -294,10 +347,12 @@ async def _request(method: str, path: str, *, user: bool = False,
                 f"Spotify {method} {path} failed ({resp.status_code}): {detail}",
                 status=resp.status_code, body=resp.text[:500], detail=detail,
             )
+        _breaker.close()
         if resp.status_code == 204 or not resp.content:
             return {}
         return resp.json()
-    raise SpotifyError(f"Spotify {method} {path} failed after retries (rate limited).", status=429)
+    raise SpotifyError(f"Spotify {method} {path} failed: token could not be refreshed.",
+                       status=401)
 
 
 async def _api_get(path: str, *, user: bool = False, params: dict | None = None) -> Any:
@@ -351,22 +406,33 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
     queries.append(f"{artists[0]} {titles[0]}")
 
     seen: set[str] = set()
+    deadline = time.monotonic() + SEARCH_BUDGET
     for query in queries:
         if query in seen:
             continue
         seen.add(query)
+        if time.monotonic() >= deadline:
+            break  # out of budget; score what we have rather than stall the queue
         try:
             data = await _api_get(
                 "/search",
                 params={"q": query, "type": "track", "limit": limit, "market": market},
             )
+        except SpotifyThrottled:
+            # Abandon the remaining spellings: they would each be refused too.
+            # Propagating also lets the caller tell an outage from a real miss.
+            raise
         except SpotifyError:
             continue
         for item in ((data.get("tracks") or {}).get("items") or []):
             parsed = _parse_track(item)
             if parsed["ext_id"] and parsed["ext_id"] not in results:
                 results[parsed["ext_id"]] = parsed
-        if len(results) >= limit:
+        # Enough alternatives for the scorer to discriminate between a real
+        # match and a karaoke cut. Stopping at the first single hit would be
+        # cheaper but can lock onto a cover before the reversed-name spelling
+        # ("Elfman Danny") has been tried at all.
+        if len(results) >= 3:
             break
 
     return list(results.values())

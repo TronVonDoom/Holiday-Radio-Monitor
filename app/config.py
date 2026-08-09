@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Holiday Radio Matcher"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 USER_AGENT = (
     f"HolidayRadioMatcher/{APP_VERSION} "
     "( https://github.com/TronVonDoom/Holiday-Radio-Monitor )"
@@ -72,7 +72,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- Poller --------------------------------------------------------------
     "poll_interval_seconds": "45",
     "musicbrainz_rate_limit_seconds": "1.1",
-    # How long to stop calling MusicBrainz after it returns 503/429. Escalates to
+    # How long to stop calling a provider after it returns 503/429. Escalates to
     # 3x, 10x and 30x this value while the throttling persists.
     "musicbrainz_cooldown_seconds": "60",
+    "spotify_cooldown_seconds": "60",
 }

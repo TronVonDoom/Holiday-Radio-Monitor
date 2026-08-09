@@ -187,15 +187,19 @@ async function renderDashboard() {
   const c = stats.counts;
   const resolved = c.matched + c.confirmed;
   const rate = Math.round(stats.match_rate * 100);
-  const mb = stats.musicbrainz;
+  // Either provider can be in a cooldown; name whichever is.
+  const providers = [["MusicBrainz", stats.musicbrainz], ["Spotify", stats.spotify]];
+  const cold = providers.filter(([, p]) => p && p.throttled).map(([n]) => n);
+  const coldFor = providers.filter(([, p]) => p && p.throttled)
+                           .map(([, p]) => p.cooldown_seconds || 0);
 
   const tiles = [
     { label: "Matched", value: resolved, foot: `${rate}% of resolved songs`, bar: rate },
     { label: "Needs review", value: c.review + c.unmatched, foot: "waiting on you" },
-    // A MusicBrainz cooldown is the one thing that makes a busy-looking queue
-    // stop draining, so it outranks "matching now…" here.
-    { label: "In queue", value: c.pending, foot: mb && mb.throttled
-        ? `MusicBrainz paused ${Math.ceil(mb.cooldown_seconds)}s`
+    // A provider cooldown is the one thing that makes a busy-looking queue stop
+    // draining, so it outranks "matching now…" here.
+    { label: "In queue", value: c.pending, foot: cold.length
+        ? `${cold.join(" & ")} paused ${Math.ceil(Math.max(...coldFor))}s`
         : stats.worker.matching ? "matching now…" : "idle" },
     { label: "Playlist tracks", value: stats.playlist_entries, foot: `${stats.stations} station(s)` },
     { label: "Learned rules", value: stats.aliases, foot: "auto-match forever" },
@@ -575,9 +579,13 @@ async function renderSettings() {
           <div class="row">
             <div class="field"><label>MusicBrainz cooldown (seconds)</label>
               <input type="number" id="s-mbcool" value="${esc(v.musicbrainz_cooldown_seconds)}">
-              <span class="hint">How long to stop calling MusicBrainz after it asks us to
-                slow down. Escalates to 3×, 10× and 30× if throttling continues; matching
-                falls back to Spotify meanwhile.</span></div>
+              <span class="hint">How long to stop calling a provider after it asks us to
+                slow down. Escalates to 3×, 10× and 30× if throttling continues;
+                matching falls back to the other provider meanwhile.</span></div>
+            <div class="field"><label>Spotify cooldown (seconds)</label>
+              <input type="number" id="s-spcool" value="${esc(v.spotify_cooldown_seconds)}">
+              <span class="hint">Spotify's quota is per application, so this throttle
+                follows the matcher rather than your network.</span></div>
           </div>
           <div class="row">
             <label class="switch"><input type="checkbox" id="s-m3u" ${v.m3u_enabled === "1" ? "checked" : ""}> Write .m3u8 files</label>
@@ -674,8 +682,9 @@ function applyStats(stats) {
   const worker = $("#worker-state");
   const busy = stats.worker.polling || stats.worker.matching;
   worker.classList.toggle("busy", !!busy);
-  const throttled = stats.musicbrainz && stats.musicbrainz.throttled;
-  worker.lastElementChild.textContent = throttled ? "MusicBrainz paused"
+  const paused = [["MusicBrainz", stats.musicbrainz], ["Spotify", stats.spotify]]
+    .filter(([, p]) => p && p.throttled).map(([n]) => n);
+  worker.lastElementChild.textContent = paused.length ? `${paused.join(" & ")} paused`
     : stats.worker.matching ? "Matching…"
     : stats.worker.polling ? "Polling…" : "Idle";
   $("#app-version").textContent = `v${stats.version}`;
@@ -944,6 +953,7 @@ document.addEventListener("click", async (ev) => {
       min_song_seconds: $("#s-minlen").value,
       poll_interval_seconds: $("#s-poll").value,
       musicbrainz_cooldown_seconds: $("#s-mbcool").value,
+      spotify_cooldown_seconds: $("#s-spcool").value,
       spotify_market: $("#s-market").value.toUpperCase(),
       use_musicbrainz: $("#s-mb").checked ? "1" : "0",
       use_spotify: $("#s-sp").checked ? "1" : "0",

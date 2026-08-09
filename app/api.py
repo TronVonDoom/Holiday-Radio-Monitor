@@ -149,6 +149,7 @@ def stats() -> dict[str, Any]:
             "configured": spotify.is_configured(),
             "linked": spotify.is_user_linked(),
             "user": db.get_setting("spotify_user_name", ""),
+            **spotify.status(),
         },
         "playlist_dir": playlists.playlist_dir_status(),
         "musicbrainz": musicbrainz.status(),

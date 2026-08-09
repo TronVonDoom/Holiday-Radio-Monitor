@@ -385,12 +385,19 @@ async def enrich_with_spotify(candidate: dict[str, Any], raw_artist: str,
         return candidate
 
     isrc = candidate.get("isrc") or ""
-    tracks = await spotify.search_isrc(isrc) if isrc else []
-    if not tracks:
-        tracks = await spotify.search(
-            candidate.get("artist") or raw_artist,
-            candidate.get("title") or raw_title,
-        )
+    try:
+        tracks = await spotify.search_isrc(isrc) if isrc else []
+        if not tracks:
+            tracks = await spotify.search(
+                candidate.get("artist") or raw_artist,
+                candidate.get("title") or raw_title,
+            )
+    except spotify.SpotifyThrottled:
+        # The identification is already correct; only the playable link is
+        # missing. Keep the match and let the sync loop attach the URI once
+        # Spotify is answering again, rather than discarding a good match or
+        # re-running the whole resolve on every retry.
+        return candidate
     if not tracks:
         return candidate
 

@@ -226,9 +226,14 @@ async def match_song(song: dict[str, Any]) -> str:
     if result.best is None:
         # A provider outage must not harden into a permanent "not found": leave
         # the song pending so the backoff query picks it up again later.
-        if result.retryable and int(song["attempts"]) < MAX_RETRY_ATTEMPTS:
+        if result.retryable:
+            # Hand the attempt back. Every provider being unavailable says nothing
+            # about this song, and counting it would let a long outage burn the
+            # whole queue's retry budget and mark hundreds of songs unmatched.
+            # A cooldown makes each of these retries cost no requests at all.
             db.execute(
-                "UPDATE songs SET status = 'pending', nonsong_reason = ? WHERE id = ?",
+                "UPDATE songs SET status = 'pending', attempts = MAX(attempts - 1, 0), "
+                "nonsong_reason = ? WHERE id = ?",
                 (f"Retrying — {result.reason}"[:500], song["id"]),
             )
             return "retry"
@@ -338,9 +343,74 @@ async def _match_loop() -> None:
         await asyncio.sleep(2 if counts else 20)
 
 
+# How many unlinked songs one healing pass will try. Small so a long backlog
+# cannot turn into a burst of Spotify calls.
+LINK_BATCH = 5
+
+
+async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
+    """Attach a Spotify URI to correct matches that do not have one yet.
+
+    A MusicBrainz-only identification is right but not playable, and enrichment
+    is skipped outright when Spotify is throttled. Without this pass those songs
+    would stay off the Spotify playlist permanently, because sync only ever
+    considers entries that already carry a URI.
+    """
+    from .providers import spotify
+
+    if not spotify.is_configured() or spotify.cooldown_remaining() > 0:
+        return 0
+
+    songs = [dict(r) for r in db.query(
+        "SELECT * FROM songs WHERE status IN ('matched', 'confirmed') "
+        "AND (spotify_uri IS NULL OR spotify_uri = '') "
+        "ORDER BY play_count DESC LIMIT ?",
+        (limit,),
+    )]
+
+    linked = 0
+    for song in songs:
+        candidate = {
+            "source": "musicbrainz" if song["mbid"] else "",
+            "artist": song["match_artist"] or song["raw_artist"],
+            "title": song["match_title"] or song["raw_title"],
+            "album": song["match_album"] or "",
+            "duration": song["match_duration"] or song["duration"],
+            "isrc": song["isrc"] or "",
+            "mbid": song["mbid"],
+            "art_url": song["match_art_url"] or "",
+        }
+        try:
+            merged = await matcher.enrich_with_spotify(
+                candidate, song["raw_artist"], song["raw_title"], song["duration"]
+            )
+        except Exception as exc:  # noqa: BLE001 - best effort, never fatal
+            db.log_event(f"Could not link {candidate['artist']} - {candidate['title']} "
+                         f"to Spotify: {exc}", level="warn", source="sync")
+            continue
+        if not merged.get("uri"):
+            continue
+        db.execute(
+            "UPDATE songs SET spotify_id = ?, spotify_uri = ?, spotify_url = ?, "
+            "isrc = COALESCE(NULLIF(?, ''), isrc), "
+            "match_art_url = COALESCE(NULLIF(match_art_url, ''), NULLIF(?, '')) "
+            "WHERE id = ?",
+            (merged.get("spotify_id"), merged.get("uri"), merged.get("url"),
+             merged.get("isrc") or "", merged.get("art_url") or "", song["id"]),
+        )
+        enqueue_for_playlists(int(song["id"]))
+        linked += 1
+
+    if linked:
+        db.log_event(f"Attached a Spotify link to {linked} previously unlinked match(es)",
+                     source="sync")
+    return linked
+
+
 async def _sync_loop() -> None:
     while True:
         try:
+            await link_unlinked_songs()
             await playlists.sync_all()
         except asyncio.CancelledError:
             raise
