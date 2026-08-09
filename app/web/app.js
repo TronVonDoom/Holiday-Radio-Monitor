@@ -497,7 +497,9 @@ async function renderStations() {
         <p class="sub">Point this at an AzuraCast server to list every station it hosts, then add them in one click.</p>
         <div class="row">
           <div class="field"><label>Server URL</label>
-            <input type="text" id="disc-url" value="https://radio1.streamserver.link"></div>
+            <input type="text" id="disc-url" value="https://radio1.streamserver.link">
+            <span class="hint">The server address, not a stream link — though a
+              stream URL is trimmed back to the server automatically.</span></div>
           <button class="btn" id="disc-go">Discover</button>
         </div>
         <div id="disc-results" style="margin-top:.9rem"></div>
@@ -810,8 +812,13 @@ document.addEventListener("click", async (ev) => {
   if (t.id === "disc-go") {
     t.disabled = true; t.textContent = "Looking…";
     try {
-      const res = await api("/stations/discover", { method: "POST", body: { base_url: $("#disc-url").value } });
-      $("#disc-results").innerHTML = res.stations.map((s) => `
+      const typed = $("#disc-url").value.trim();
+      const res = await api("/stations/discover", { method: "POST", body: { base_url: typed } });
+      // Say so when the pasted address was trimmed back to the server root.
+      const note = res.base && res.base !== typed.replace(/\/+$/, "")
+        ? `<div class="muted" style="margin-bottom:.6rem">Found ${res.count} station(s) on
+           <code>${esc(res.base)}</code></div>` : "";
+      $("#disc-results").innerHTML = note + res.stations.map((s) => `
         <div class="cand">
           <div class="ph">${icon("radio", 18)}</div>
           <div class="info"><b>${esc(s.name)}</b>

@@ -68,26 +68,92 @@ def _split_combined(text: str) -> tuple[str, str]:
 
 # --- AzuraCast ---------------------------------------------------------------
 
-async def discover_azuracast(base_url: str) -> list[dict[str, Any]]:
-    """List every station on an AzuraCast server, for one-click adding."""
-    base = base_url.rstrip("/")
-    if not base.startswith("http"):
-        base = f"https://{base}"
-    resp = await _get_client().get(f"{base}/api/stations")
-    resp.raise_for_status()
-    stations = resp.json()
-    out = []
-    for s in stations if isinstance(stations, list) else []:
-        mounts = s.get("mounts") or []
-        listen = s.get("listen_url") or (mounts[0].get("url") if mounts else "")
-        out.append({
-            "name": s.get("name") or "",
-            "shortcode": s.get("shortcode") or "",
-            "description": s.get("description") or "",
-            "listen_url": listen,
-            "azuracast_base": base,
-        })
-    return out
+class DiscoveryError(RuntimeError):
+    """No AzuraCast station list could be found at the address given."""
+
+
+# Enough to cover a deep mount path without turning one click into a scan.
+MAX_DISCOVERY_BASES = 8
+DISCOVERY_TIMEOUT = httpx.Timeout(6.0)
+
+
+def discovery_bases(url: str) -> list[str]:
+    """Candidate AzuraCast roots for whatever was pasted, best guess first.
+
+    People reach for the address they already have, which is usually a stream
+    mount like https://host/radio/8020/hro-aac - but the station list lives at
+    the server root. AzuraCast can equally be installed under a subpath, so the
+    typed path is tried first and then trimmed one segment at a time.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return []
+    if not re.match(r"^https?://", raw, re.I):
+        raw = f"https://{raw}"
+
+    parts = urlparse(raw)
+    if not parts.hostname or any(c.isspace() for c in parts.netloc):
+        return []
+
+    path = parts.path.rstrip("/")
+    for suffix in ("/api/stations", "/api/nowplaying", "/api"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    segments = [s for s in path.split("/") if s]
+
+    netlocs = [parts.netloc]
+    # A mount URL usually carries the streaming port; the web API answers on
+    # the normal one, so the bare host is worth a try too.
+    if parts.port and parts.port not in (80, 443):
+        netlocs.append(parts.hostname or "")
+
+    bases = [
+        urlunparse((parts.scheme, netloc,
+                    "/" + "/".join(segments[:depth]) if depth else "", "", "", ""))
+        for netloc in netlocs
+        for depth in range(len(segments), -1, -1)
+    ]
+    return list(dict.fromkeys(bases))[:MAX_DISCOVERY_BASES]
+
+
+async def discover_azuracast(base_url: str) -> tuple[str, list[dict[str, Any]]]:
+    """List every station on an AzuraCast server. Returns (base_used, stations)."""
+    candidates = discovery_bases(base_url)
+    if not candidates:
+        raise DiscoveryError("Enter the address of the AzuraCast server.")
+
+    for base in candidates:
+        try:
+            resp = await _get_client().get(f"{base}/api/stations",
+                                           timeout=DISCOVERY_TIMEOUT)
+            resp.raise_for_status()
+            stations = resp.json()
+        except Exception:  # noqa: BLE001 - any failure just means "not here"
+            continue
+        # A JSON array from /api/stations is AzuraCast answering; an empty one
+        # is a real answer too, so stop rather than keep climbing.
+        if not isinstance(stations, list):
+            continue
+
+        out = []
+        for s in stations:
+            mounts = s.get("mounts") or []
+            listen = s.get("listen_url") or (mounts[0].get("url") if mounts else "")
+            out.append({
+                "name": s.get("name") or "",
+                "shortcode": s.get("shortcode") or "",
+                "description": s.get("description") or "",
+                "listen_url": listen,
+                "azuracast_base": base,
+            })
+        return base, out
+
+    root = candidates[-1]
+    raise DiscoveryError(
+        f"No AzuraCast station list at that address. Give Discover the server "
+        f"itself — {root} — rather than a stream or mount URL."
+    )
 
 
 def _parse_azuracast_song(song: dict[str, Any], duration: int | None,

@@ -248,14 +248,17 @@ def delete_station(station_id: int) -> dict[str, str]:
 @router.post("/stations/discover")
 async def discover(payload: DiscoverIn) -> dict[str, Any]:
     try:
-        found = await sources.discover_azuracast(payload.base_url)
+        base, found = await sources.discover_azuracast(payload.base_url)
+    except sources.DiscoveryError as exc:
+        # Already phrased for the user; wrapping it only adds noise.
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"Could not read station list: {exc}") from exc
     known = {row["azuracast_shortcode"] for row in db.query(
         "SELECT azuracast_shortcode FROM stations WHERE azuracast_shortcode IS NOT NULL")}
     for station in found:
         station["already_added"] = station["shortcode"] in known
-    return {"stations": found, "count": len(found)}
+    return {"stations": found, "count": len(found), "base": base}
 
 
 @router.post("/stations/probe")
