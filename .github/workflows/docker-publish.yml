@@ -5,10 +5,8 @@ name: Build and publish container image
 #
 #   ghcr.io/tronvondoom/holiday-radio-monitor:latest
 #
-# After the first successful run, make the package public once:
-#   github.com/users/TronVonDoom/packages/container/holiday-radio-monitor/settings
-#   -> Change visibility -> Public
-# Otherwise UnRaid needs registry credentials to pull it.
+# The package inherits the repository's visibility, so while this repo is public
+# the image is anonymously pullable and UnRaid needs no registry credentials.
 
 on:
   push:

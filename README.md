@@ -75,13 +75,8 @@ UnRaid pulls it directly — nothing is built on the server.
 ghcr.io/tronvondoom/holiday-radio-monitor:latest
 ```
 
-### One-time: make the package public
-
-After the first workflow run, the container package is **private** by default and
-UnRaid cannot pull it anonymously. Fix it once:
-
-> github.com/users/TronVonDoom/packages/container/holiday-radio-monitor/settings
-> → **Danger Zone** → **Change visibility** → **Public**
+Published for `linux/amd64` and `linux/arm64`, and public — UnRaid pulls it
+without any registry credentials.
 
 ### Install the template
 
