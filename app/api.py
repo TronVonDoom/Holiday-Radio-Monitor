@@ -513,6 +513,7 @@ def get_settings() -> dict[str, Any]:
             "linked": spotify.is_user_linked(),
             "user": db.get_setting("spotify_user_name", ""),
             "scopes": spotify.SCOPES,
+            "missing_scopes": spotify.missing_scopes(),
         },
         "playlist_dir": playlists.playlist_dir_status(),
         "config_dir": str(config.CONFIG_DIR),
@@ -648,6 +649,24 @@ async def spotify_exchange(payload: ExchangeIn) -> dict[str, Any]:
 def spotify_unlink() -> dict[str, str]:
     spotify.unlink()
     return {"status": "unlinked"}
+
+
+@router.post("/spotify/diagnose")
+async def spotify_diagnose() -> dict[str, Any]:
+    """Test every step playlist delivery depends on, and say which one fails.
+
+    A POST because the write check really does create a playlist on the account
+    (and then unfollows it) - that round trip is the only honest answer to
+    "can this app write playlists?".
+    """
+    try:
+        report = await spotify.diagnose()
+    except Exception as exc:  # noqa: BLE001 - the report is the error channel
+        raise HTTPException(400, f"Could not check Spotify access: {exc}") from exc
+    if not report["ok"]:
+        db.log_event(f"Spotify access check failed: {report['hint']}",
+                     level="warn", source="spotify")
+    return report
 
 
 @router.get("/spotify/redirect-uri")

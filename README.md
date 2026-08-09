@@ -136,14 +136,34 @@ configuration needed to see it working.
    what is playing right now before you commit.
 
 2. **Connect Spotify** (optional but recommended) — *Settings → Spotify*:
-   - Create a free app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
+   - Create a free app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard),
+     making sure **Web API** is ticked when you choose which APIs the app uses
    - Copy the **redirect URI** shown in Settings into the Spotify app's settings
    - Paste the Client ID and Secret into Settings and save
    - Click **Connect Spotify account**
+   - Click **Test Spotify access** to confirm the link can really write playlists
 
    Without Spotify the app still works: it identifies songs through MusicBrainz
    and writes `.m3u8` files. Spotify adds playable links, real playlists, and a
    meaningful lift in match coverage.
+
+   <details>
+   <summary>If syncing fails with <code>403 Forbidden</code></summary>
+
+   Spotify sends a bare 403 with no explanation for several unrelated problems.
+   **Test Spotify access** walks the whole delivery path — token refresh, account
+   read, granted permissions, playlist read, and a real playlist create/remove —
+   and names the step that fails. The usual causes, in order:
+
+   - **The app is still in Development mode** and the Spotify account is not on
+     its user list. Add it under *Dashboard → your app → Settings → User
+     Management*, using the account's email exactly.
+   - **The app was created without the Web API product.** Enable Web API in the
+     app's settings, or create a new app with it ticked.
+   - **The saved login predates the permissions playlists need.** Disconnect and
+     reconnect; the Settings page flags this on its own once it knows the granted
+     scopes.
+   </details>
 
 3. **Work the review queue** — the badge in the sidebar shows how many songs are
    waiting. Each shows the stream metadata, ranked candidates, and *why* each

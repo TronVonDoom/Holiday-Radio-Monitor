@@ -87,6 +87,11 @@ async def sync_spotify(station: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "reason": "Spotify is not configured."}
     if not spotify.is_user_linked():
         return {"ok": False, "reason": "Spotify account is not connected."}
+    missing = spotify.missing_scopes()
+    if missing:
+        return {"ok": False, "needs_auth": True,
+                "reason": f"The Spotify login is missing the {', '.join(missing)} "
+                          "permission(s). Disconnect and reconnect it in Settings."}
 
     entries = station_entries(int(station["id"]))
     wanted = [e for e in entries if e["spotify_uri"]]

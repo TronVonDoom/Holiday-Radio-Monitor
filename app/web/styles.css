@@ -157,7 +157,17 @@ th {
 td { padding: .55rem .6rem; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A right-aligned column is only aligned if its header agrees. */
+td.num, th.num { text-align: right; }
+td.num { font-variant-numeric: tabular-nums; }
+/* Controls sit in the flow of their cell instead of stretching across it,
+   so a .num cell still parks them under a right-aligned header. */
+td .switch, td .btn, td .conf { vertical-align: middle; }
+
+/* Blank rows that hold a short last page at full height, so paging through a
+   table never resizes the card around it. */
+tr.filler td { height: var(--row-h, 56px); padding: 0; border-bottom-color: transparent; }
+tr.filler:hover { background: none; }
 
 .track { display: flex; align-items: center; gap: .65rem; min-width: 0; }
 .track img, .track .ph {
@@ -253,7 +263,7 @@ input[type=text], input[type=password], input[type=number], input[type=url], sel
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: flex-end; }
 .row > .field { flex: 1 1 200px; margin-bottom: 0; }
-.switch { display: flex; align-items: center; gap: .55rem; cursor: pointer; font-size: .88rem; }
+.switch { display: inline-flex; align-items: center; gap: .55rem; cursor: pointer; font-size: .88rem; }
 .switch input { appearance: none; width: 38px; height: 21px; border-radius: 999px; background: var(--line); position: relative; cursor: pointer; transition: background .18s; flex-shrink: 0; }
 .switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 50%; background: var(--text-dim); transition: transform .18s, background .18s; }
 .switch input:checked { background: color-mix(in srgb, var(--accent) 65%, transparent); }
@@ -268,6 +278,50 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 }
 .chip:hover { color: var(--text); }
 .chip.on { background: color-mix(in srgb, var(--accent) 18%, transparent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); color: var(--text); }
+
+/* ---------- pagination ---------- */
+/* Always rendered, even for a single page, so a card keeps the same footprint
+   whether it holds three rows or three hundred. */
+.pager {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: .75rem; flex-wrap: wrap;
+  min-height: 34px; margin-top: .85rem;
+  padding-top: .7rem; border-top: 1px solid var(--line-soft);
+}
+.pager .range { color: var(--text-faint); font-size: .8rem; font-variant-numeric: tabular-nums; }
+.pg-group { display: flex; align-items: center; gap: .2rem; margin-left: auto; }
+.pg {
+  min-width: 30px; height: 30px; padding: 0 .5rem;
+  border-radius: var(--radius-s); border: 1px solid var(--line);
+  background: var(--bg-elev-2); color: var(--text-dim);
+  font: inherit; font-size: .82rem; font-variant-numeric: tabular-nums;
+  cursor: pointer; transition: color .15s, border-color .15s, background .15s;
+}
+.pg:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.pg.on {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--text); font-weight: 650;
+}
+.pg:disabled { opacity: .35; cursor: not-allowed; }
+.pg-group .gap { color: var(--text-faint); padding: 0 .15rem; }
+
+/* A live feed scrolls inside a fixed frame rather than pushing the page down. */
+.feed { max-height: 320px; overflow: auto; }
+
+/* ---------- diagnostics ---------- */
+.diag { display: grid; gap: .4rem; margin-top: .8rem; }
+.diag .chk { display: flex; gap: .55rem; align-items: baseline; font-size: .84rem; }
+.diag .chk .mark { flex-shrink: 0; width: 1rem; font-weight: 700; }
+.diag .chk.pass .mark { color: var(--ok); }
+.diag .chk.fail .mark { color: var(--bad); }
+.diag .chk .detail { color: var(--text-faint); font-size: .78rem; }
+.diag .verdict {
+  margin-top: .3rem; padding: .55rem .7rem; border-radius: var(--radius-s);
+  font-size: .82rem; border: 1px solid var(--line); background: var(--bg-elev-2);
+}
+.diag .verdict.fail { border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.diag .verdict.pass { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 
 /* ---------- toasts / modal ---------- */
 .toasts { position: fixed; right: 1rem; bottom: 1rem; display: grid; gap: .5rem; z-index: 100; }

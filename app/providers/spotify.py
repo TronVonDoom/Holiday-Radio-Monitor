@@ -28,6 +28,11 @@ API = "https://api.spotify.com/v1"
 
 SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private"
 
+# Everything playlist delivery actually exercises. Kept separate from SCOPES so
+# a link made by an older build can be checked against today's requirements.
+REQUIRED_SCOPES = ("playlist-modify-private", "playlist-modify-public",
+                   "playlist-read-private")
+
 _client: httpx.AsyncClient | None = None
 _token_lock = asyncio.Lock()
 
@@ -37,7 +42,13 @@ _app_token: tuple[str, float] = ("", 0.0)
 
 
 class SpotifyError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None, body: str = "",
+                 detail: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+        # Spotify's own one-line explanation, unwrapped from its error envelope.
+        self.detail = detail
 
 
 class SpotifyAuthRequired(SpotifyError):
@@ -74,6 +85,23 @@ def is_user_linked() -> bool:
     return bool(db.get_setting("spotify_refresh_token", "").strip())
 
 
+def granted_scopes() -> set[str]:
+    """Scopes Spotify actually attached to the stored login.
+
+    Empty when the link predates scope recording; every token refresh fills it
+    in, so it becomes known on its own within an hour of use.
+    """
+    return {s for s in db.get_setting("spotify_scopes", "").split() if s}
+
+
+def missing_scopes() -> list[str]:
+    """Required scopes the login provably lacks. Empty when unknown."""
+    granted = granted_scopes()
+    if not granted:
+        return []
+    return [s for s in REQUIRED_SCOPES if s not in granted]
+
+
 def _basic_auth_header() -> dict[str, str]:
     cid, secret = credentials()
     blob = base64.b64encode(f"{cid}:{secret}".encode()).decode()
@@ -101,6 +129,22 @@ def authorize_url(redirect_uri: str, state: str) -> str:
     return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
+def _store_user_token(payload: dict[str, Any]) -> None:
+    """Cache the access token and record which scopes Spotify granted it.
+
+    The scope list is the only reliable way to tell a login that can write
+    playlists from one that merely looks connected, so it is captured from
+    every token response - the initial exchange and each refresh alike.
+    """
+    global _user_token
+    _user_token = (
+        payload.get("access_token", ""),
+        time.monotonic() + payload.get("expires_in", 3600) - 60,
+    )
+    if payload.get("scope") is not None:
+        db.set_setting("spotify_scopes", payload.get("scope") or "")
+
+
 async def exchange_code(code: str, redirect_uri: str) -> None:
     resp = await _get_client().post(
         TOKEN_URL,
@@ -108,13 +152,13 @@ async def exchange_code(code: str, redirect_uri: str) -> None:
         headers={**_basic_auth_header(), "Content-Type": "application/x-www-form-urlencoded"},
     )
     if resp.status_code != 200:
-        raise SpotifyError(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
+        raise SpotifyError(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}",
+                           status=resp.status_code, body=resp.text[:500])
     payload = resp.json()
     refresh = payload.get("refresh_token", "")
     if refresh:
         db.set_setting("spotify_refresh_token", refresh)
-    global _user_token
-    _user_token = (payload.get("access_token", ""), time.monotonic() + payload.get("expires_in", 3600) - 60)
+    _store_user_token(payload)
 
     me = await _api_get("/me", user=True)
     db.set_setting("spotify_user_id", me.get("id", ""))
@@ -124,7 +168,8 @@ async def exchange_code(code: str, redirect_uri: str) -> None:
 def unlink() -> None:
     global _user_token
     _user_token = ("", 0.0)
-    for key in ("spotify_refresh_token", "spotify_user_id", "spotify_user_name"):
+    for key in ("spotify_refresh_token", "spotify_user_id", "spotify_user_name",
+                "spotify_scopes"):
         db.set_setting(key, "")
 
 
@@ -160,10 +205,7 @@ async def _user_access_token() -> str:
         payload = resp.json()
         if payload.get("refresh_token"):
             db.set_setting("spotify_refresh_token", payload["refresh_token"])
-        _user_token = (
-            payload.get("access_token", ""),
-            time.monotonic() + payload.get("expires_in", 3600) - 60,
-        )
+        _store_user_token(payload)
         return _user_token[0]
 
 
@@ -209,6 +251,20 @@ async def _token(user: bool) -> str:
 
 # --- request plumbing --------------------------------------------------------
 
+def _error_text(resp: httpx.Response) -> str:
+    """Spotify's own explanation, unwrapped from its error envelope."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return resp.text[:200].strip()
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or "").strip() or resp.reason_phrase
+    if isinstance(error, str):
+        return payload.get("error_description") or error
+    return resp.text[:200].strip()
+
+
 async def _request(method: str, path: str, *, user: bool = False,
                    params: dict | None = None, json: Any = None) -> Any:
     url = path if path.startswith("http") else f"{API}{path}"
@@ -228,11 +284,15 @@ async def _request(method: str, path: str, *, user: bool = False,
             _app_token = ("", 0.0)
             continue
         if resp.status_code >= 400:
-            raise SpotifyError(f"Spotify {method} {path} failed ({resp.status_code}): {resp.text[:300]}")
+            detail = _error_text(resp)
+            raise SpotifyError(
+                f"Spotify {method} {path} failed ({resp.status_code}): {detail}",
+                status=resp.status_code, body=resp.text[:500], detail=detail,
+            )
         if resp.status_code == 204 or not resp.content:
             return {}
         return resp.json()
-    raise SpotifyError(f"Spotify {method} {path} failed after retries (rate limited).")
+    raise SpotifyError(f"Spotify {method} {path} failed after retries (rate limited).", status=429)
 
 
 async def _api_get(path: str, *, user: bool = False, params: dict | None = None) -> Any:
@@ -328,6 +388,71 @@ async def current_user() -> dict[str, Any]:
     return await _api_get("/me", user=True)
 
 
+FORBIDDEN_HELP = (
+    "Spotify refused the write (403). The usual causes, in the order worth "
+    "checking: the Spotify app is still in Development mode and this account "
+    "is not on its user list; the app was created without the Web API product "
+    "enabled; or the saved login is missing the playlist scopes and needs "
+    "disconnecting and reconnecting. Settings → Test Spotify access says which."
+)
+
+
+def _friendly(exc: SpotifyError) -> SpotifyError:
+    """Turn a raw Spotify failure into something a user can act on."""
+    if exc.status != 403:
+        return exc
+
+    missing = missing_scopes()
+    if missing:
+        return SpotifyAuthRequired(
+            "The saved Spotify login is missing the "
+            f"{', '.join(missing)} permission(s). Disconnect and reconnect "
+            "the account in Settings.", status=403,
+        )
+
+    # Spotify usually says nothing but "Forbidden", but when it does name a
+    # cause that beats any guess we could offer.
+    detail = (exc.detail or "").strip()
+    said = "" if detail.lower() in ("", "forbidden") else f" Spotify said: {detail}"
+    return SpotifyError(FORBIDDEN_HELP + said, status=403, body=exc.body, detail=detail)
+
+
+async def _resolve_user_id(*, refresh: bool = False) -> str:
+    """The account id the token belongs to, re-read from Spotify when asked."""
+    if not refresh:
+        cached = db.get_setting("spotify_user_id", "").strip()
+        if cached:
+            return cached
+    me = await current_user()
+    user_id = (me.get("id") or "").strip()
+    if user_id:
+        db.set_setting("spotify_user_id", user_id)
+        db.set_setting("spotify_user_name", me.get("display_name") or user_id)
+    return user_id
+
+
+async def create_playlist(name: str, description: str) -> str:
+    body = {"name": name, "description": description[:300], "public": False}
+
+    # A stored account id that no longer matches the token - after relinking to
+    # a different Spotify account, say - is itself a 403, and indistinguishable
+    # from a permissions problem in the response. Re-read /me once and retry
+    # before blaming the app configuration.
+    for stale in (False, True):
+        try:
+            user_id = await _resolve_user_id(refresh=stale)
+            if not user_id:
+                raise SpotifyError("Spotify did not return an account id for this login.")
+            created = await _request("POST", f"/users/{user_id}/playlists",
+                                     user=True, json=body)
+        except SpotifyError as exc:
+            if exc.status == 403 and not stale:
+                continue
+            raise _friendly(exc) from exc
+        return created.get("id", "")
+    return ""
+
+
 async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
     """Return a usable playlist id, creating or repairing it as needed."""
     if playlist_id:
@@ -340,16 +465,13 @@ async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
             # Deleted or no longer accessible - fall through and make a new one.
             pass
 
-    user_id = db.get_setting("spotify_user_id", "").strip()
-    if not user_id:
-        user_id = (await current_user()).get("id", "")
-        db.set_setting("spotify_user_id", user_id)
-
-    created = await _request(
-        "POST", f"/users/{user_id}/playlists", user=True,
-        json={"name": name, "description": description[:300], "public": False},
-    )
-    return created.get("id", "")
+    missing = missing_scopes()
+    if missing:
+        raise SpotifyAuthRequired(
+            f"The saved Spotify login is missing the {', '.join(missing)} "
+            "permission(s). Disconnect and reconnect the account in Settings."
+        )
+    return await create_playlist(name, description)
 
 
 async def playlist_track_uris(playlist_id: str) -> set[str]:
@@ -371,8 +493,11 @@ async def add_tracks(playlist_id: str, uris: list[str]) -> int:
     added = 0
     for i in range(0, len(uris), 100):
         chunk = uris[i:i + 100]
-        await _request("POST", f"/playlists/{playlist_id}/tracks", user=True,
-                       json={"uris": chunk})
+        try:
+            await _request("POST", f"/playlists/{playlist_id}/tracks", user=True,
+                           json={"uris": chunk})
+        except SpotifyError as exc:
+            raise _friendly(exc) from exc
         added += len(chunk)
     return added
 
@@ -382,3 +507,109 @@ async def remove_tracks(playlist_id: str, uris: list[str]) -> None:
         chunk = [{"uri": u} for u in uris[i:i + 100]]
         await _request("DELETE", f"/playlists/{playlist_id}/tracks", user=True,
                        json={"tracks": chunk})
+
+
+async def unfollow_playlist(playlist_id: str) -> None:
+    """Remove a playlist from the user's library (Spotify's closest thing to a delete)."""
+    await _request("DELETE", f"/playlists/{playlist_id}/followers", user=True)
+
+
+# --- diagnostics -------------------------------------------------------------
+
+async def diagnose() -> dict[str, Any]:
+    """Walk the whole delivery path and report where it actually breaks.
+
+    A 403 from Spotify carries no usable detail, so the only way to tell a
+    scope problem from an app-configuration problem is to try each step in
+    order. The write probe creates a private playlist and immediately unfollows
+    it, which is why this runs on request rather than on every sync.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> bool:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+        return ok
+
+    report: dict[str, Any] = {"ok": False, "checks": checks, "hint": ""}
+
+    if not record("Client ID and secret saved", is_configured(),
+                  "" if is_configured() else "Add them in Settings and save."):
+        report["hint"] = "Spotify is not configured yet."
+        return report
+
+    if not record("Account linked", is_user_linked(),
+                  "" if is_user_linked() else "Use 'Connect Spotify account'."):
+        report["hint"] = "Search works without this, playlists do not."
+        return report
+
+    try:
+        await _user_access_token()
+        record("Login token refreshes", True)
+    except SpotifyError as exc:
+        record("Login token refreshes", False, str(exc))
+        report["hint"] = "Reconnect the Spotify account in Settings."
+        return report
+
+    try:
+        me = await current_user()
+    except SpotifyError as exc:
+        record("Account readable (/me)", False, str(exc))
+        report["hint"] = FORBIDDEN_HELP if exc.status == 403 else str(exc)
+        return report
+
+    user_id = (me.get("id") or "").strip()
+    record("Account readable (/me)", True,
+           f"{me.get('display_name') or user_id} · {me.get('product') or 'unknown plan'} "
+           f"· {me.get('country') or '??'}")
+    report["user_id"] = user_id
+
+    stored = db.get_setting("spotify_user_id", "").strip()
+    if stored and stored != user_id:
+        db.set_setting("spotify_user_id", user_id)
+    record("Stored account id matches the login", not stored or stored == user_id,
+           "" if not stored or stored == user_id
+           else f"was {stored}, now corrected to {user_id}")
+
+    granted = granted_scopes()
+    missing = missing_scopes()
+    report["scopes"] = sorted(granted)
+    if not granted:
+        record("Permissions granted", True,
+               "not recorded yet — it is filled in on the next token refresh")
+    elif missing:
+        record("Permissions granted", False, f"missing {', '.join(missing)}")
+        report["hint"] = ("Disconnect and reconnect the Spotify account to grant "
+                          "the missing permissions.")
+        return report
+    else:
+        record("Permissions granted", True, " ".join(sorted(granted)))
+
+    try:
+        await _api_get("/me/playlists", user=True, params={"limit": 1})
+        record("Can read your playlists", True)
+    except SpotifyError as exc:
+        record("Can read your playlists", False, str(exc))
+
+    probe_id = ""
+    try:
+        probe_id = await create_playlist(
+            "Holiday Radio Matcher — access test",
+            "Temporary playlist created to verify write access. Safe to delete.",
+        )
+        record("Can create a playlist", bool(probe_id))
+        report["ok"] = bool(probe_id)
+    except SpotifyError as exc:
+        record("Can create a playlist", False, str(exc))
+        report["hint"] = str(exc)
+        return report
+
+    if probe_id:
+        try:
+            await unfollow_playlist(probe_id)
+            record("Test playlist cleaned up", True)
+        except SpotifyError as exc:
+            record("Test playlist cleaned up", False,
+                   f"remove 'Holiday Radio Matcher — access test' by hand ({exc})")
+
+    report["hint"] = "Everything Spotify delivery needs is working."
+    return report

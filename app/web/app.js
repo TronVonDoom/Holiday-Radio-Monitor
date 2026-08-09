@@ -48,8 +48,12 @@ function toast(message, kind = "") {
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.textContent = message;
+  el.title = "Click to dismiss";
+  el.addEventListener("click", () => el.remove());
   $("#toasts").append(el);
-  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, 3800);
+  // Failures usually carry an explanation worth reading, so they linger.
+  const life = kind === "bad" ? 12000 : 3800;
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, life);
 }
 
 /* ---------- api ---------- */
@@ -103,6 +107,61 @@ const emptyState = (glyph, title, note = "") =>
   `<div class="empty"><div class="big">${glyph}</div><div><strong>${esc(title)}</strong></div>
    ${note ? `<div class="muted" style="margin-top:.35rem">${esc(note)}</div>` : ""}</div>`;
 
+/* ---------- pagination ---------- */
+
+const PAGE = { library: 25, stations: 10, playlist: 10 };
+
+const span = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+// Exactly seven slots once there is more than one screenful, so the control
+// never changes width as you page through — that width change is what makes a
+// paginated table feel like it is shifting under you.
+function pageWindow(current, pages) {
+  if (pages <= 7) return span(1, pages);
+  if (current <= 4) return [...span(1, 5), "…", pages];
+  if (current >= pages - 3) return [1, "…", ...span(pages - 4, pages)];
+  return [1, "…", current - 1, current, current + 1, "…", pages];
+}
+
+/* Renders a stable pagination footer. `key` namespaces the click targets so
+   several pagers can coexist on one view. */
+function pager(key, { total, page, size, unit = "item" }) {
+  const pages = Math.max(1, Math.ceil(total / size));
+  const current = Math.min(Math.max(1, page), pages);
+  const from = total ? (current - 1) * size + 1 : 0;
+  const to = Math.min(current * size, total);
+
+  const btn = (label, target, { on = false, off = false, aria = "" } = {}) =>
+    `<button class="pg${on ? " on" : ""}" data-page="${esc(key)}:${target}"
+       ${off ? "disabled" : ""} ${aria ? `aria-label="${esc(aria)}"` : ""}>${label}</button>`;
+
+  const numbers = pages > 1
+    ? pageWindow(current, pages).map((p) =>
+        p === "…" ? `<span class="gap">…</span>` : btn(p, p, { on: p === current })).join("")
+    : "";
+
+  return `
+    <div class="pager">
+      <span class="range">${total
+        ? `${from.toLocaleString()}–${to.toLocaleString()} of ${total.toLocaleString()} ${esc(unit)}${total === 1 ? "" : "s"}`
+        : `No ${esc(unit)}s`}</span>
+      <div class="pg-group">
+        ${btn("←", current - 1, { off: current <= 1, aria: "Previous page" })}
+        ${numbers}
+        ${btn("→", current + 1, { off: current >= pages, aria: "Next page" })}
+      </div>
+    </div>`;
+}
+
+/* Blank rows that hold a short final page at the height of a full one. Only
+   used once a table actually spans more than one page — a small table should
+   still size itself naturally. */
+const fillerRows = (shown, size, total, cols) =>
+  total > size && shown < size
+    ? Array.from({ length: size - shown },
+        () => `<tr class="filler"><td colspan="${cols}"></td></tr>`).join("")
+    : "";
+
 /* ---------- state ---------- */
 
 const state = {
@@ -110,7 +169,9 @@ const state = {
   stats: null,
   reviewIndex: 0,
   reviewQueue: [],
-  library: { status: "", q: "", sort: "recent", offset: 0 },
+  library: { status: "", q: "", sort: "recent", page: 1 },
+  stationsPage: 1,
+  playlistPages: {},   // station id -> page number
   timer: null,
 };
 
@@ -176,7 +237,7 @@ async function renderDashboard() {
         </div>
         <div class="card">
           <h2>Recent plays</h2><p class="sub">Newest first, across all stations</p>
-          <div class="table-wrap"><table>
+          <div class="table-wrap feed"><table>
             <thead><tr><th>Track</th><th>Station</th><th>Status</th><th class="num">Played</th></tr></thead>
             <tbody>${recentRows || `<tr><td colspan="4" class="muted">Nothing yet — the poller runs every ${state.stats ? "minute" : "45s"}.</td></tr>`}</tbody>
           </table></div>
@@ -294,11 +355,20 @@ async function renderReviewCard() {
 /* ---------- library ---------- */
 
 async function renderLibrary() {
-  const { status, q, sort, offset } = state.library;
-  const params = new URLSearchParams({ sort, limit: "50", offset: String(offset) });
+  const { status, q, sort } = state.library;
+  const size = PAGE.library;
+  const offset = (state.library.page - 1) * size;
+  const params = new URLSearchParams({ sort, limit: String(size), offset: String(offset) });
   if (status) params.set("status", status);
   if (q) params.set("q", q);
-  const data = await api(`/songs?${params}`);
+  let data = await api(`/songs?${params}`);
+
+  // Deleting or reclassifying songs can strand the view past the last page.
+  if (!data.items.length && data.total) {
+    state.library.page = Math.max(1, Math.ceil(data.total / size));
+    params.set("offset", String((state.library.page - 1) * size));
+    data = await api(`/songs?${params}`);
+  }
 
   const chips = ["", "matched", "confirmed", "review", "unmatched", "pending", "nonsong"]
     .map((s) => `<button class="chip ${state.library.status === s ? "on" : ""}" data-filter="${s}">
@@ -327,18 +397,14 @@ async function renderLibrary() {
         <option value="confidence"${sort === "confidence" ? " selected" : ""}>Lowest confidence</option>
         <option value="artist"${sort === "artist" ? " selected" : ""}>Artist A–Z</option>
       </select>
-      <span class="muted">${data.total.toLocaleString()} song(s)</span>
     </div>
     <div class="card"><div class="table-wrap"><table>
       <thead><tr><th>Matched as</th><th>Stream metadata</th><th>Status</th>
-        <th>Confidence</th><th class="num">Plays</th><th class="num">Last seen</th><th></th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="7">${emptyState("🔍", "Nothing here yet")}</td></tr>`}</tbody>
+        <th>Confidence</th><th class="num">Plays</th><th class="num">Last seen</th><th class="num"></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7">${emptyState("🔍", "Nothing here yet")}</td></tr>`}
+        ${fillerRows(data.items.length, size, data.total, 7)}</tbody>
     </table></div>
-    ${data.total > 50 ? `<div class="row" style="margin-top:.8rem;justify-content:center">
-      <button class="btn ghost sm" id="lib-prev" ${offset === 0 ? "disabled" : ""}>← Previous</button>
-      <span class="muted">${offset + 1}–${Math.min(offset + 50, data.total)}</span>
-      <button class="btn ghost sm" id="lib-next" ${offset + 50 >= data.total ? "disabled" : ""}>Next →</button>
-    </div>` : ""}
+    ${pager("lib", { total: data.total, page: state.library.page, size, unit: "song" })}
     </div>`;
 }
 
@@ -346,9 +412,16 @@ async function renderLibrary() {
 
 async function renderPlaylists() {
   const lists = await api("/playlists");
+  const size = PAGE.playlist;
+
   const cards = await Promise.all(lists.map(async (p) => {
     const tracks = await api(`/playlists/${p.id}/tracks`);
-    const rows = tracks.slice(0, 12).map((t) => `
+    const pages = Math.max(1, Math.ceil(tracks.length / size));
+    const page = Math.min(Math.max(1, state.playlistPages[p.id] || 1), pages);
+    state.playlistPages[p.id] = page;
+
+    const shown = tracks.slice((page - 1) * size, page * size);
+    const rows = shown.map((t) => `
       <tr><td><div class="track">${artwork(t.match_art_url || t.art_url)}
         <div class="t"><b>${esc(t.match_title || t.raw_title)}</b>
         <span>${esc(t.match_artist || t.raw_artist)}</span></div></div></td>
@@ -368,8 +441,11 @@ async function renderPlaylists() {
             <button class="btn sm" data-sync="${p.id}">Sync now</button>
           </div>
         </div>
-        <div class="table-wrap"><table><tbody>${rows || `<tr><td class="muted">No matched tracks yet.</td></tr>`}</tbody></table></div>
-        ${p.entries > 12 ? `<div class="muted" style="margin-top:.5rem">+ ${p.entries - 12} more</div>` : ""}
+        <div class="table-wrap"><table>
+          <tbody>${rows || `<tr><td class="muted">No matched tracks yet.</td></tr>`}
+            ${fillerRows(shown.length, size, tracks.length, 3)}</tbody>
+        </table></div>
+        ${pager(`pl-${p.id}`, { total: tracks.length, page, size, unit: "track" })}
       </div>`;
   }));
 
@@ -381,13 +457,19 @@ async function renderPlaylists() {
 
 async function renderStations() {
   const stations = await api("/stations");
-  const rows = stations.map((s) => `
+  const size = PAGE.stations;
+  const pages = Math.max(1, Math.ceil(stations.length / size));
+  const page = Math.min(Math.max(1, state.stationsPage), pages);
+  state.stationsPage = page;
+
+  const shown = stations.slice((page - 1) * size, page * size);
+  const rows = shown.map((s) => `
     <tr data-holiday="${esc(s.holiday)}">
       <td><b>${esc(s.name)}</b><div class="muted">${esc(s.azuracast_shortcode || s.icy_url || "")}</div></td>
       <td><span class="badge holiday">${esc(s.holiday)}</span></td>
       <td class="num muted">${s.plays}</td>
       <td class="num muted">${s.playlist_count}</td>
-      <td class="muted">${s.last_error
+      <td class="num muted">${s.last_error
         ? `<span style="color:var(--bad)">${esc(s.last_error.slice(0, 48))}</span>`
         : fmtTime(s.last_polled_at)}</td>
       <td class="num">
@@ -401,9 +483,12 @@ async function renderStations() {
       <h2>Monitored stations</h2><p class="sub">The poller reads each enabled station on the interval set in Settings.</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Station</th><th>Holiday</th><th class="num">Plays</th>
-          <th class="num">Playlist</th><th>Last poll</th><th class="num">On</th><th></th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="7">${emptyState("📡", "No stations configured")}</td></tr>`}</tbody>
+          <th class="num">Playlist</th><th class="num">Last poll</th>
+          <th class="num">On</th><th class="num"></th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="7">${emptyState("📡", "No stations configured")}</td></tr>`}
+          ${fillerRows(shown.length, size, stations.length, 7)}</tbody>
       </table></div>
+      ${pager("st", { total: stations.length, page, size, unit: "station" })}
     </div>
 
     <div class="grid two">
@@ -511,9 +596,14 @@ async function renderSettings() {
           <div class="row" style="margin-top:.4rem">
             ${sp.linked
               ? `<span class="badge matched">Connected as ${esc(sp.user || "user")}</span>
+                 <button class="btn ghost sm" id="sp-diagnose">Test Spotify access</button>
                  <button class="btn ghost sm" id="sp-unlink">Disconnect</button>`
               : `<button class="btn" id="sp-link" ${sp.configured ? "" : "disabled"}>Connect Spotify account</button>`}
           </div>
+          ${sp.missing_scopes?.length ? `<div class="muted" style="margin-top:.5rem;color:var(--warn)">
+            ⚠ This link is missing ${esc(sp.missing_scopes.join(", "))}. Disconnect and
+            reconnect to grant it.</div>` : ""}
+          <div id="sp-diag"></div>
           ${!sp.configured ? `<div class="muted" style="margin-top:.5rem">
             Create a free app at <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com</a>,
             then paste the ID and secret above and save.</div>` : ""}
@@ -603,14 +693,26 @@ async function refresh() {
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-reject],[data-nonsong],[data-rematch]," +
-    "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station]," +
+    "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
     "#btn-refresh,#btn-sync,#rv-prev,#rv-skip,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
-    "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#lib-prev,#lib-next");
+    "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
   if (!t) return;
 
   const d = t.dataset;
 
   if (d.view) return show(d.view);
+
+  if (d.page) {
+    const [key, page] = d.page.split(":");
+    const target = Math.max(1, +page);
+    if (key === "lib") { state.library.page = target; return renderLibrary(); }
+    if (key === "st")  { state.stationsPage = target; return renderStations(); }
+    if (key.startsWith("pl-")) {
+      state.playlistPages[key.slice(3)] = target;
+      return renderPlaylists();
+    }
+    return;
+  }
 
   if (t.id === "btn-refresh") { await show(state.view); return toast("Refreshed"); }
 
@@ -678,11 +780,9 @@ document.addEventListener("click", async (ev) => {
   }
 
   if (d.filter !== undefined) {
-    state.library.status = d.filter; state.library.offset = 0;
+    state.library.status = d.filter; state.library.page = 1;
     return renderLibrary();
   }
-  if (t.id === "lib-prev") { state.library.offset = Math.max(0, state.library.offset - 50); return renderLibrary(); }
-  if (t.id === "lib-next") { state.library.offset += 50; return renderLibrary(); }
 
   if (d.sync) {
     t.disabled = true; t.textContent = "Syncing…";
@@ -789,6 +889,27 @@ document.addEventListener("click", async (ev) => {
     } catch (e) { toast(e.message, "bad"); t.disabled = false; t.textContent = "Finish"; }
     return;
   }
+  if (t.id === "sp-diagnose") {
+    const box = $("#sp-diag");
+    t.disabled = true;
+    box.innerHTML = `<div class="diag"><div class="muted"><span class="spinner"></span>
+      Checking — this creates and removes one temporary playlist.</div></div>`;
+    try {
+      const r = await api("/spotify/diagnose", { method: "POST" });
+      box.innerHTML = `<div class="diag">
+        ${r.checks.map((c) => `
+          <div class="chk ${c.ok ? "pass" : "fail"}">
+            <span class="mark">${c.ok ? "✓" : "✕"}</span>
+            <span>${esc(c.name)}${c.detail ? `<span class="detail"> — ${esc(c.detail)}</span>` : ""}</span>
+          </div>`).join("")}
+        <div class="verdict ${r.ok ? "pass" : "fail"}">${esc(r.hint)}</div>
+      </div>`;
+    } catch (e) {
+      box.innerHTML = `<div class="diag"><div class="verdict fail">${esc(e.message)}</div></div>`;
+    } finally { t.disabled = false; }
+    return;
+  }
+
   if (t.id === "sp-unlink") {
     await api("/spotify/unlink", { method: "POST" });
     toast("Spotify disconnected"); return renderSettings();
@@ -822,7 +943,7 @@ document.addEventListener("change", async (ev) => {
     await api(`/stations/${el.dataset.toggle}`, { method: "PATCH", body: { enabled: el.checked } });
     toast(el.checked ? "Station enabled" : "Station paused");
   }
-  if (el.id === "lib-sort") { state.library.sort = el.value; state.library.offset = 0; renderLibrary(); }
+  if (el.id === "lib-sort") { state.library.sort = el.value; state.library.page = 1; renderLibrary(); }
 });
 
 let searchTimer;
@@ -830,7 +951,7 @@ document.addEventListener("input", (ev) => {
   if (ev.target.id !== "lib-q") return;
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
-    state.library.q = ev.target.value; state.library.offset = 0;
+    state.library.q = ev.target.value; state.library.page = 1;
     renderLibrary().then(() => $("#lib-q")?.focus());
   }, 320);
 });
