@@ -68,7 +68,8 @@ class ConfirmIn(BaseModel):
 class SearchIn(BaseModel):
     artist: str = ""
     title: str = ""
-    limit: int = Field(default=8, ge=1, le=20)
+    # Spotify caps /search at 10 results per call as of February 2026.
+    limit: int = Field(default=8, ge=1, le=10)
 
 
 class SettingsIn(BaseModel):

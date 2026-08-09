@@ -150,10 +150,17 @@ configuration needed to see it working.
    <details>
    <summary>If syncing fails with <code>403 Forbidden</code></summary>
 
-   Spotify sends a bare 403 with no explanation for several unrelated problems.
-   **Test Spotify access** walks the whole delivery path — token refresh, account
-   read, granted permissions, playlist read, and a real playlist create/remove —
-   and names the step that fails. The usual causes, in order:
+   Versions before v1.0.1 created playlists through `POST /users/{user_id}/playlists`.
+   Spotify withdrew that endpoint from Development Mode apps in its
+   [February 2026 Web API changes](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide),
+   enforced for existing apps on **9 March 2026**, and it now answers a bare 403
+   for every caller with no indication that the endpoint itself is the problem.
+   v1.0.1 moved to `POST /me/playlists`; **update the container** and it works again.
+
+   If a 403 survives the update, **Test Spotify access** walks the whole delivery
+   path — token refresh, account read, granted permissions, playlist read, and a
+   real playlist create/remove — and names the step that fails. What is left to
+   check:
 
    - **The app is still in Development mode** and the Spotify account is not on
      its user list. Add it under *Dashboard → your app → Settings → User

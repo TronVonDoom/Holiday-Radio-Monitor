@@ -26,7 +26,12 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
 
-SCOPES = "playlist-modify-public playlist-modify-private playlist-read-private"
+# user-library-modify is requested but not required: it is only used to tidy
+# away the playlist the access test creates. Asking for it does not invalidate
+# an existing link, and REQUIRED_SCOPES deliberately leaves it out so nobody is
+# told to reconnect over a cleanup nicety.
+SCOPES = ("playlist-modify-public playlist-modify-private playlist-read-private "
+          "user-library-modify")
 
 # Everything playlist delivery actually exercises. Kept separate from SCOPES so
 # a link made by an older build can be checked against today's requirements.
@@ -321,11 +326,17 @@ def _parse_track(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# /search caps `limit` at 10 since February 2026, down from 50. Asking for more
+# is rejected outright, so every call is clamped rather than trusted.
+SEARCH_LIMIT_MAX = 10
+
+
 async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]]:
     """Search tracks across plausible artist/title spellings."""
     if not is_configured():
         return []
 
+    limit = max(1, min(limit, SEARCH_LIMIT_MAX))
     market = db.get_setting("spotify_market", "US").strip() or "US"
     results: dict[str, dict[str, Any]] = {}
     artists = artist_variants(artist) or [artist]
@@ -389,11 +400,10 @@ async def current_user() -> dict[str, Any]:
 
 
 FORBIDDEN_HELP = (
-    "Spotify refused the write (403). The usual causes, in the order worth "
-    "checking: the Spotify app is still in Development mode and this account "
-    "is not on its user list; the app was created without the Web API product "
-    "enabled; or the saved login is missing the playlist scopes and needs "
-    "disconnecting and reconnecting. Settings → Test Spotify access says which."
+    "Spotify refused the write (403). Check that the account is on the Spotify "
+    "app's user list (Dashboard → your app → Settings → User Management), that "
+    "the app has the Web API product enabled, and that the login still holds "
+    "the playlist scopes. Settings → Test Spotify access says which."
 )
 
 
@@ -417,40 +427,20 @@ def _friendly(exc: SpotifyError) -> SpotifyError:
     return SpotifyError(FORBIDDEN_HELP + said, status=403, body=exc.body, detail=detail)
 
 
-async def _resolve_user_id(*, refresh: bool = False) -> str:
-    """The account id the token belongs to, re-read from Spotify when asked."""
-    if not refresh:
-        cached = db.get_setting("spotify_user_id", "").strip()
-        if cached:
-            return cached
-    me = await current_user()
-    user_id = (me.get("id") or "").strip()
-    if user_id:
-        db.set_setting("spotify_user_id", user_id)
-        db.set_setting("spotify_user_name", me.get("display_name") or user_id)
-    return user_id
-
-
 async def create_playlist(name: str, description: str) -> str:
-    body = {"name": name, "description": description[:300], "public": False}
+    """Create a private playlist on the linked account.
 
-    # A stored account id that no longer matches the token - after relinking to
-    # a different Spotify account, say - is itself a 403, and indistinguishable
-    # from a permissions problem in the response. Re-read /me once and retry
-    # before blaming the app configuration.
-    for stale in (False, True):
-        try:
-            user_id = await _resolve_user_id(refresh=stale)
-            if not user_id:
-                raise SpotifyError("Spotify did not return an account id for this login.")
-            created = await _request("POST", f"/users/{user_id}/playlists",
-                                     user=True, json=body)
-        except SpotifyError as exc:
-            if exc.status == 403 and not stale:
-                continue
-            raise _friendly(exc) from exc
-        return created.get("id", "")
-    return ""
+    Uses POST /me/playlists. The older POST /users/{user_id}/playlists was
+    withdrawn from Development Mode apps in Spotify's February 2026 Web API
+    changes (enforced for existing apps on 9 March 2026) and now answers a bare
+    403 for every caller, with no hint that the endpoint itself is the problem.
+    """
+    body = {"name": name, "description": description[:300], "public": False}
+    try:
+        created = await _request("POST", "/me/playlists", user=True, json=body)
+    except SpotifyError as exc:
+        raise _friendly(exc) from exc
+    return created.get("id", "")
 
 
 async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
@@ -475,13 +465,21 @@ async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
 
 
 async def playlist_track_uris(playlist_id: str) -> set[str]:
+    """Every track URI already in the playlist.
+
+    Reads /playlists/{id}/items - the February 2026 replacement for
+    /playlists/{id}/tracks - where each entry carries the track under `item`.
+    `track` is still populated but documented as deprecated, so it is only a
+    fallback here.
+    """
     uris: set[str] = set()
-    url = f"/playlists/{playlist_id}/tracks"
-    params: dict | None = {"fields": "items(track(uri)),next", "limit": 100}
+    url = f"/playlists/{playlist_id}/items"
+    # limit is capped at 50 on the items endpoint, down from 100 on /tracks.
+    params: dict | None = {"fields": "items(item(uri),track(uri)),next", "limit": 50}
     while url:
         data = await _api_get(url, user=True, params=params)
-        for item in data.get("items") or []:
-            track = item.get("track") or {}
+        for entry in data.get("items") or []:
+            track = entry.get("item") or entry.get("track") or {}
             if track.get("uri"):
                 uris.add(track["uri"])
         url = data.get("next") or ""
@@ -494,7 +492,7 @@ async def add_tracks(playlist_id: str, uris: list[str]) -> int:
     for i in range(0, len(uris), 100):
         chunk = uris[i:i + 100]
         try:
-            await _request("POST", f"/playlists/{playlist_id}/tracks", user=True,
+            await _request("POST", f"/playlists/{playlist_id}/items", user=True,
                            json={"uris": chunk})
         except SpotifyError as exc:
             raise _friendly(exc) from exc
@@ -505,13 +503,20 @@ async def add_tracks(playlist_id: str, uris: list[str]) -> int:
 async def remove_tracks(playlist_id: str, uris: list[str]) -> None:
     for i in range(0, len(uris), 100):
         chunk = [{"uri": u} for u in uris[i:i + 100]]
-        await _request("DELETE", f"/playlists/{playlist_id}/tracks", user=True,
-                       json={"tracks": chunk})
+        # The body key was renamed from `tracks` alongside the path.
+        await _request("DELETE", f"/playlists/{playlist_id}/items", user=True,
+                       json={"items": chunk})
 
 
 async def unfollow_playlist(playlist_id: str) -> None:
-    """Remove a playlist from the user's library (Spotify's closest thing to a delete)."""
-    await _request("DELETE", f"/playlists/{playlist_id}/followers", user=True)
+    """Drop a playlist from the user's library - Spotify has no playlist delete.
+
+    The per-entity DELETE /playlists/{id}/followers was folded into the generic
+    library endpoint in February 2026, which takes URIs as a query parameter
+    rather than a body and needs user-library-modify.
+    """
+    await _request("DELETE", "/me/library", user=True,
+                   params={"uris": f"spotify:playlist:{playlist_id}"})
 
 
 # --- diagnostics -------------------------------------------------------------
@@ -557,10 +562,11 @@ async def diagnose() -> dict[str, Any]:
         report["hint"] = FORBIDDEN_HELP if exc.status == 403 else str(exc)
         return report
 
+    # `country`, `product` and `email` were dropped from the user object in
+    # February 2026, so there is nothing left here worth reporting but identity.
     user_id = (me.get("id") or "").strip()
     record("Account readable (/me)", True,
-           f"{me.get('display_name') or user_id} · {me.get('product') or 'unknown plan'} "
-           f"· {me.get('country') or '??'}")
+           f"{me.get('display_name') or user_id} ({user_id})")
     report["user_id"] = user_id
 
     stored = db.get_setting("spotify_user_id", "").strip()
@@ -608,8 +614,12 @@ async def diagnose() -> dict[str, Any]:
             await unfollow_playlist(probe_id)
             record("Test playlist cleaned up", True)
         except SpotifyError as exc:
+            hint = ("reconnect the account to grant cleanup permission"
+                    if "user-library-modify" not in granted_scopes()
+                    else str(exc))
             record("Test playlist cleaned up", False,
-                   f"remove 'Holiday Radio Matcher — access test' by hand ({exc})")
+                   f"remove 'Holiday Radio Matcher — access test' from your "
+                   f"library by hand — {hint}")
 
     report["hint"] = "Everything Spotify delivery needs is working."
     return report
