@@ -21,6 +21,11 @@ PLAYLIST_DESCRIPTION = (
     "Auto-built by Holiday Radio Matcher from the {name} live stream."
 )
 
+# How stale our record of a playlist's contents may get before it is checked
+# against Spotify itself. Only edits made outside this app can invalidate it,
+# so hours is the right order of magnitude, not minutes.
+RECONCILE_AFTER = 6 * 3600
+
 
 def _safe_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\s.-]", "", name).strip().replace(" ", "-")
@@ -104,7 +109,8 @@ async def sync_spotify(station: dict[str, Any]) -> dict[str, Any]:
     # nothing to do. At 50 tracks per page, one station per two minutes, that is
     # thousands of pointless requests a day against an application-wide quota,
     # which is what got the whole app rate limited for hours at a time.
-    if not any(not e["spotify_synced"] for e in wanted):
+    unsent = [e for e in wanted if not e["spotify_synced"]]
+    if not unsent:
         return {"ok": True, "added": 0, "reason": "Nothing new to add.",
                 "total": len(wanted)}
 
@@ -120,11 +126,24 @@ async def sync_spotify(station: dict[str, Any]) -> dict[str, Any]:
         db.execute("UPDATE stations SET spotify_playlist_id = ? WHERE id = ?",
                    (playlist_id, station["id"]))
 
-    existing = await spotify.playlist_track_uris(playlist_id)
+    # Reading the playlist back is what makes delivery idempotent against edits
+    # made in Spotify itself, and it is by far the most expensive call here: a
+    # thousand-track playlist is twenty requests at 50 per page. Doing it on
+    # every pass meant every newly matched song cost a full re-read of the
+    # playlist it was joining. Our own spotify_synced record is an accurate log
+    # of what we sent, so it carries the common case, and the re-read runs on a
+    # schedule to catch the one thing that record cannot know about: a track
+    # already present that we never sent.
+    reconciled_at = station["spotify_reconciled_at"] or 0
+    due = (db.now() - reconciled_at) >= RECONCILE_AFTER
+    existing = await spotify.playlist_track_uris(playlist_id) if due else set()
+    if due:
+        db.execute("UPDATE stations SET spotify_reconciled_at = ? WHERE id = ?",
+                   (db.now(), station["id"]))
 
     to_add: list[str] = []
     seen: set[str] = set()
-    for entry in wanted:
+    for entry in unsent:
         uri = entry["spotify_uri"]
         if uri in existing or uri in seen:
             continue

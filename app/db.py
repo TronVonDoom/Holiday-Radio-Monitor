@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS stations (
     -- Fallback source: raw Icecast/SHOUTcast mount with ICY metadata
     icy_url             TEXT,
     spotify_playlist_id TEXT,
+    -- When the playlist was last read back from Spotify to check our record of
+    -- what is in it. Reading it is what makes delivery idempotent against manual
+    -- edits, and also the single most expensive thing this app does, so it is
+    -- done on a schedule rather than on every pass.
+    spotify_reconciled_at INTEGER,
     m3u_filename        TEXT,
     last_polled_at      INTEGER,
     last_error          TEXT,
@@ -230,6 +235,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE songs ADD COLUMN link_attempts INTEGER NOT NULL DEFAULT 0")
     if "link_after" not in columns:
         conn.execute("ALTER TABLE songs ADD COLUMN link_after INTEGER")
+
+    station_columns = {row["name"] for row in conn.execute("PRAGMA table_info(stations)")}
+    if "spotify_reconciled_at" not in station_columns:
+        conn.execute("ALTER TABLE stations ADD COLUMN spotify_reconciled_at INTEGER")
 
     cand_columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
     for column in ("mbid", "spotify_id"):
