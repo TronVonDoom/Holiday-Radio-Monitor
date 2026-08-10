@@ -472,12 +472,50 @@ def mark_nonsong(song_id: int, remember: bool = Query(default=True)) -> dict[str
     return _song_or_404(song_id)
 
 
+@router.post("/songs/{song_id}/is-song")
+async def mark_is_song(song_id: int, remember: bool = Query(default=True)) -> dict[str, Any]:
+    """Overturn a not-a-song verdict and put the song back through matching.
+
+    The exact inverse of `mark_nonsong`, and the only way out of that status.
+    Simply re-running the matcher was not enough: the filter is deterministic,
+    so a song it wrongly caught was caught again on every retry and every
+    re-airing, forever. `remember` writes the rule that stops that happening -
+    a rule with no identity attached, which only disarms the filter and leaves
+    the providers to do the identifying.
+    """
+    song = _song_or_404(song_id)
+    if song["status"] != "nonsong":
+        raise HTTPException(409, "That song is not marked as a non-song.")
+
+    # A previous "not a song" rule would otherwise re-apply the moment matching
+    # runs, because the alias tier is checked before the filter.
+    db.execute("DELETE FROM aliases WHERE key_artist = ? AND key_title = ? AND kind = 'nonsong'",
+               (norm_key(song["raw_artist"]), norm_key(song["raw_title"])))
+    if remember:
+        _write_alias(song, {}, kind=matcher.ALIAS_IS_SONG)
+
+    db.execute(
+        "UPDATE songs SET status = 'pending', nonsong_reason = NULL, attempts = 0, "
+        "match_method = NULL WHERE id = ?", (song_id,),
+    )
+    db.log_event(
+        f"Marked {song['raw_artist']} - {song['raw_title']} as a real song "
+        f"(was: {song['nonsong_reason'] or 'filtered'})", source="review",
+    )
+    await monitor.match_song(_song_or_404(song_id))
+    return get_song(song_id)
+
+
 @router.post("/songs/{song_id}/rematch")
 async def rematch_song(song_id: int) -> dict[str, Any]:
     song = _song_or_404(song_id)
-    # Drop any learned alias so the search actually runs again.
-    db.execute("DELETE FROM aliases WHERE key_artist = ? AND key_title = ?",
-               (norm_key(song["raw_artist"]), norm_key(song["raw_title"])))
+    # Drop any learned identity so the search actually runs again - but never
+    # the "this is a song" override, which is a permission rather than an
+    # answer. Clearing that would hand the song straight back to the filter
+    # that wrongly caught it, which is the opposite of re-matching it.
+    db.execute("DELETE FROM aliases WHERE key_artist = ? AND key_title = ? AND kind != ?",
+               (norm_key(song["raw_artist"]), norm_key(song["raw_title"]),
+                matcher.ALIAS_IS_SONG))
     db.execute("UPDATE songs SET status = 'pending', attempts = 0 WHERE id = ?", (song_id,))
     await monitor.match_song(_song_or_404(song_id))
     return get_song(song_id)

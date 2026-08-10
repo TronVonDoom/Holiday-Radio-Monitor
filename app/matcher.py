@@ -93,6 +93,21 @@ CORROBORATION_BONUS = {2: 0.07, 3: 0.10}
 MAX_CORROBORATION_BONUS = 0.12
 ISRC_BONUS = 0.12
 
+# Alias kind meaning "this metadata is real music, whatever the filter thinks".
+#
+# The non-song heuristics have to be aggressive - station imaging shares a lot
+# of surface with music, and one jingle in a playlist is worse than one song in
+# review - so they will always catch some real songs. A short interlude, a
+# soundtrack cue under the minimum length, an artist field the station left as
+# "Various". Marking one of those as a song used to be impossible to undo: the
+# heuristics are deterministic, so re-running them produced the same verdict
+# forever, and the song was stuck.
+#
+# This rule carries no identity, unlike a confirmation. It says only "do not
+# apply the filter to this metadata", and matching then proceeds normally - so
+# the song goes to the providers and lands wherever its confidence puts it.
+ALIAS_IS_SONG = "song"
+
 # How many ranked candidates a resolve hands back for the review UI. The UI shows
 # the top few and reveals the rest on request, so this is the size of the "load
 # more" pool rather than the size of the list anyone reads.
@@ -439,7 +454,10 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
         "SELECT * FROM aliases WHERE key_artist = ? AND key_title = ?",
         (key_artist, key_title),
     )
-    if alias is not None:
+    # A rule saying "this really is music" carries no identity, so it does not
+    # resolve anything - it only disarms the filter below. See ALIAS_IS_SONG.
+    force_song = alias is not None and alias["kind"] == ALIAS_IS_SONG
+    if alias is not None and not force_song:
         db.execute("UPDATE aliases SET hits = hits + 1 WHERE id = ?", (alias["id"],))
         if alias["kind"] == "nonsong":
             return MatchResult(status="nonsong", method="learned",
@@ -464,10 +482,13 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
             },
         )
 
-    # --- Tier 0: non-song filter
-    reason = detect_nonsong(raw_artist, raw_title, raw_album, duration, min_seconds)
-    if reason:
-        return MatchResult(status="nonsong", method="filter", reason=reason)
+    # --- Tier 0: non-song filter, unless the user has overruled it here.
+    if force_song:
+        db.execute("UPDATE aliases SET hits = hits + 1 WHERE id = ?", (alias["id"],))
+    else:
+        reason = detect_nonsong(raw_artist, raw_title, raw_album, duration, min_seconds)
+        if reason:
+            return MatchResult(status="nonsong", method="filter", reason=reason)
 
     # --- Tier 2: provider search. Every enabled catalogue at once - they share
     # no resource, so the wait is the slowest one rather than the sum.

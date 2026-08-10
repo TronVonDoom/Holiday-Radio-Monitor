@@ -49,6 +49,7 @@ real stream metadata is wrong. Every example below is live data from Halloween R
 | `Poor unfortunate souls ~ The Little Mermaid` | Decoration after `~` is stripped into a separate query variant |
 | `album: "www.halloweenradio.net"` | Recognised as a watermark and discarded |
 | `JINGLE — Halloweenradio.net 20-1` (16s) | Rejected as station imaging before any lookup |
+| A real song the imaging filter caught anyway | **It's a song** in the Library overturns it permanently — see below |
 | Karaoke and tribute re-recordings | Heavily penalised so they can never outrank the real thing |
 | Live bootlegs scoring identically on text | Penalised; studio releases preferred |
 | A song two catalogues have never heard of | Two more are asked; they disagree far more often than you would expect |
@@ -61,6 +62,27 @@ queued for a later retry rather than being recorded as unmatched. And when a
 song genuinely cannot be found, the queue says which catalogues answered and
 which could not be reached — so archiving something is a decision rather than a
 guess.
+
+### When the imaging filter is wrong
+
+The non-song filter has to lean towards rejecting, because one jingle in a
+playlist is worse than one song in the review queue. So it will catch real music
+sometimes — a soundtrack cue under the minimum length, a station that leaves the
+artist field as `Various`, a title that happens to look like an imaging filename.
+
+*Library → nonsong → **It's a song*** overturns it. The song goes straight back
+through matching and lands wherever its confidence puts it.
+
+The important half is that it stays overturned. The filter is deterministic, so
+simply re-running the matcher reached the same verdict every time and the song
+was stuck there permanently. So the button also writes a rule — one that carries
+no identity, unlike a confirmation, and does nothing but disarm the filter for
+that exact artist and title. Rules are listed in *Settings → Learned rules* as
+*always treated as music*, and deleting one puts the song back under the filter.
+
+Each filtered song records *why* it was filtered; hover the button to see it. If
+the reason is the track length, the minimum is in Settings rather than something
+to overturn song by song.
 
 ### Four catalogues, and why
 
@@ -297,7 +319,7 @@ configuration needed to see it working.
 |---|---|
 | **Dashboard** | Match rate, queue depth, what is on air across every station, recent plays, worker activity |
 | **Review** | The queue: search at the top, then ranked candidates with per-signal score breakdowns. Resolve, archive for later, or mark as imaging |
-| **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence — and where the archive lives |
+| **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence — where the archive lives, and where a wrongly filtered song is rescued |
 | **Playlists** | What is being delivered per station, with links into Spotify, JSON export, and duplicate cleanup |
 | **Stations** | Add, discover, test, pause and remove streams |
 | **Settings** | Thresholds, providers, Spotify link, and your learned rules |

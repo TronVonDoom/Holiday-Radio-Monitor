@@ -561,6 +561,9 @@ async function renderLibrary() {
       <td class="num muted">${fmtTime(r.last_seen_at)}</td>
       <td class="num">${r.status === "archived"
         ? `<button class="btn ghost sm" data-unarchive="${r.id}">Restore</button>`
+        : r.status === "nonsong"
+        ? `<button class="btn ghost sm" data-issong="${r.id}"
+             title="${esc(r.nonsong_reason || "Filtered as station imaging")}">It's a song</button>`
         : r.spotify_url ? `<a href="${esc(r.spotify_url)}" target="_blank" rel="noopener">Spotify</a>` : ""}</td>
     </tr>`).join("");
 
@@ -568,6 +571,13 @@ async function renderLibrary() {
     ? `<p class="sub" style="margin:-.2rem 0 .7rem">Set aside from the review queue,
        untouched and out of the way. <strong>Restore</strong> puts one back where you
        left it.</p>`
+    : state.library.status === "nonsong"
+    ? `<p class="sub" style="margin:-.2rem 0 .7rem">Jingles, station IDs and anything
+       too short to be a song. The filter has to be aggressive, so it does catch real
+       music sometimes — a soundtrack cue under the minimum length, or a blank artist
+       field. <strong>It's a song</strong> sends one back through matching and stops
+       the filter catching it again. Hover the button for why it was filtered; if the
+       reason is the length, the minimum is in Settings.</p>`
     : "";
 
   $("#view-library").innerHTML = `
@@ -841,10 +851,14 @@ async function renderSettings() {
     <div class="row" style="margin-top:1rem"><button class="btn" id="s-save">Save settings</button></div>`;
 
   const aliases = await api("/aliases?limit=40");
+  // A 'song' rule carries no identity — it only stops the non-song filter
+  // catching this metadata — so there is no match to print on the right of it.
+  const ruleTarget = (a) => a.kind === "nonsong" ? "<em>not a song</em>"
+    : a.kind === "song" ? "<em>always treated as music</em>"
+    : esc(`${a.match_artist} — ${a.match_title}`);
   $("#alias-list").innerHTML = aliases.length ? aliases.map((a) => `
     <div><span class="ts">${a.hits}×</span>
-    <span>${esc(a.key_artist)} — ${esc(a.key_title)} →
-    ${a.kind === "nonsong" ? "<em>not a song</em>" : esc(`${a.match_artist} — ${a.match_title}`)}</span>
+    <span>${esc(a.key_artist)} — ${esc(a.key_title)} → ${ruleTarget(a)}</span>
     <button class="btn bad sm" style="margin-left:auto" data-del-alias="${a.id}">×</button></div>`).join("")
     : `<div class="muted">No rules yet. They appear as you confirm matches.</div>`;
 }
@@ -903,7 +917,7 @@ async function refresh() {
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-archive],[data-unarchive]," +
-    "[data-nonsong],[data-rematch],[data-resume]," +
+    "[data-nonsong],[data-issong],[data-rematch],[data-resume]," +
     "[data-sync],[data-dedupe],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
     "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-more,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
     "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
@@ -988,6 +1002,19 @@ document.addEventListener("click", async (ev) => {
       return renderLibrary();
     } catch (e) { toast(e.message, "bad"); t.disabled = false; }
     return;
+  }
+
+  if (d.issong) {
+    t.disabled = true; t.textContent = "Matching…";
+    try {
+      // Re-matching runs inline, so the row comes back with a real verdict
+      // rather than sitting as "pending" until the background loop reaches it.
+      const song = await api(`/songs/${d.issong}/is-song`, { method: "POST" });
+      const where = { matched: "matched automatically", confirmed: "matched automatically",
+                      review: "sent to review", unmatched: "no match found — it is in the queue" };
+      toast(`${where[song.song?.status] || song.song?.status || "requeued"} · the filter will not catch it again`, "ok");
+    } catch (e) { toast(e.message, "bad"); }
+    return renderLibrary();
   }
 
   if (t.id === "rv-archived") {
