@@ -348,5 +348,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 
 a { color: var(--accent); }
 .muted { color: var(--text-faint); font-size: .82rem; }
+.warn-text { color: var(--warn); }
 .spinner { width: 15px; height: 15px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }

@@ -72,8 +72,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- Poller --------------------------------------------------------------
     "poll_interval_seconds": "45",
     "musicbrainz_rate_limit_seconds": "1.1",
-    # How long to stop calling a provider after it returns 503/429. Escalates to
-    # 3x, 10x and 30x this value while the throttling persists.
+    # How long to stop calling a provider after it returns 503/429.
+    # MusicBrainz names no delay of its own, so its floor is generous and
+    # escalates to 3x, 10x and 30x while the throttling persists. Spotify does
+    # name one - and is honoured in full when it does - so its floor only exists
+    # to prevent a tight retry loop, and escalates to 2x, 4x and 8x.
     "musicbrainz_cooldown_seconds": "60",
-    "spotify_cooldown_seconds": "60",
+    "spotify_cooldown_seconds": "10",
 }

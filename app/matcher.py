@@ -61,6 +61,11 @@ LIVE_MARKERS = ("live at", "live in", "live from", "(live", "[live", " - live",
 CORROBORATION_BONUS = 0.07
 ISRC_BONUS = 0.12
 
+# How many ranked candidates a resolve hands back for the review UI. The UI shows
+# the top few and reveals the rest on request, so this is the size of the "load
+# more" pool rather than the size of the list anyone reads.
+MAX_CANDIDATES = 12
+
 
 @dataclass
 class MatchResult:
@@ -219,6 +224,106 @@ def _best_per_source(scored: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return best
 
 
+# Two recordings of the same length to within this are the same cut, not a
+# different edit of it. Wider than the scorer's "identical" band because here we
+# already know the artist and title agree.
+MERGE_DURATION_TOLERANCE = 8
+
+
+def _is_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether two candidates are the same recording seen through two databases."""
+    isrc_a, isrc_b = (a.get("isrc") or "").upper(), (b.get("isrc") or "").upper()
+    if isrc_a and isrc_b:
+        # The recording code is an identity assertion; nothing else can overrule it.
+        return isrc_a == isrc_b
+    if not _same_recording(a, b):
+        return False
+    dur_a, dur_b = a.get("duration"), b.get("duration")
+    if dur_a and dur_b:
+        return abs(dur_a - dur_b) <= MERGE_DURATION_TOLERANCE
+    # No length on one side: title and artist agreeing is all the evidence there
+    # is, and it is the same evidence the scorer ran on.
+    return True
+
+
+def _absorb(keep: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
+    """Fold `other` into `keep`, preferring whichever side actually has a field.
+
+    MusicBrainz supplies the canonical identity (MBID, ISRC) and Spotify the
+    playable one (URI, artwork). A merged candidate carries both, which is what
+    lets a MusicBrainz identification reach a playlist without a second lookup.
+    """
+    merged = dict(keep)
+    for field_ in ("uri", "url", "art_url", "isrc", "album"):
+        if not merged.get(field_) and other.get(field_):
+            merged[field_] = other[field_]
+    for cand in (keep, other):
+        if cand.get("source") == "musicbrainz" and cand.get("ext_id"):
+            merged["mbid"] = cand["ext_id"]
+        if cand.get("source") == "spotify" and cand.get("ext_id"):
+            merged["spotify_id"] = cand["ext_id"]
+    if merged.get("duration") is None and other.get("duration") is not None:
+        merged["duration"] = other["duration"]
+    return merged
+
+
+def _sources_of(cand: dict[str, Any]) -> set[str]:
+    """Which databases back this candidate — more than one once it is a merge."""
+    recorded = (cand.get("score_detail") or {}).get("sources")
+    return {s for s in (recorded or [cand.get("source", "")]) if s}
+
+
+def merge_candidates(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate recordings into one ranked row per recording.
+
+    Both providers finding the same track used to produce two rows that were
+    scored, ranked and shown separately - which spends two of the review list's
+    slots on one answer and buries the genuine alternatives below them. Merging
+    them into a single row does three jobs at once: the list shows distinct
+    options, the merged row is playable *and* canonically identified, and
+    independent agreement between two databases becomes the confidence boost it
+    should always have been.
+
+    Input must already carry `score`. Output is sorted best first.
+    """
+    merged: list[dict[str, Any]] = []
+    for cand in sorted(scored, key=lambda c: c.get("score", 0.0), reverse=True):
+        for i, existing in enumerate(merged):
+            if not _is_duplicate(existing, cand):
+                continue
+            combined = _absorb(existing, cand)
+            detail = dict(combined.get("score_detail") or {})
+            # Union both sides: either may already be the result of an earlier
+            # merge, and only the union knows how many databases have weighed in.
+            detail["sources"] = sorted(_sources_of(existing) | _sources_of(cand))
+            already = any((c.get("score_detail") or {}).get("corroborated")
+                          for c in (existing, cand))
+            if len(detail["sources"]) > 1 and not already:
+                # Two independent databases agreeing is much stronger evidence
+                # than either one scoring well alone. Credited once per row, no
+                # matter how many times it is merged.
+                combined["score"] = min(1.0, combined.get("score", 0.0)
+                                        + CORROBORATION_BONUS)
+            detail["corroborated"] = len(detail["sources"]) > 1
+            # An ISRC match is a property of the recording, not of the row that
+            # happened to win the merge, so it survives either way round.
+            if any((c.get("score_detail") or {}).get("isrc_verified")
+                   for c in (existing, cand)):
+                detail["isrc_verified"] = True
+            detail["score"] = round(combined["score"], 4)
+            combined["score_detail"] = detail
+            merged[i] = combined
+            break
+        else:
+            merged.append(cand)
+
+    # Rank by score, then prefer the row a playlist can actually use: of two
+    # equally good answers the playable one is strictly the better suggestion.
+    merged.sort(key=lambda c: (c.get("score", 0.0), bool(c.get("uri")),
+                               c.get("native_score") or 0), reverse=True)
+    return merged
+
+
 async def resolve(raw_artist: str, raw_title: str, raw_album: str,
                   duration: int | None) -> MatchResult:
     """Resolve one piece of stream metadata to a real recording."""
@@ -302,26 +407,19 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
         enriched["score_detail"] = detail
         scored.append(enriched)
 
-    scored.sort(key=lambda c: c["score"], reverse=True)
-    best = scored[0]
-    method = f"search:{best['source']}"
-
-    # --- Tier 4: corroboration
+    # --- Tier 4: corroboration. Merging folds the same recording found in both
+    # databases into one row and credits the agreement, so `best` is already the
+    # corroborated answer where there is one.
+    # `_best_per_source` runs on the pre-merge list because the ISRC tie-break
+    # below needs the MusicBrainz row's own MBID, which a merge may have folded
+    # into a Spotify-sourced row.
     per_source = _best_per_source(scored)
     mb_best = per_source.get("musicbrainz")
-    sp_best = per_source.get("spotify")
 
-    if mb_best and sp_best and _same_recording(mb_best, sp_best):
-        # Two independent databases agreeing is much stronger evidence than
-        # either one scoring well alone.
-        boost = CORROBORATION_BONUS
-        for cand in (mb_best, sp_best):
-            cand["score"] = min(1.0, cand["score"] + boost)
-            cand["score_detail"]["corroborated"] = True
-            cand["score_detail"]["score"] = round(cand["score"], 4)
-        scored.sort(key=lambda c: c["score"], reverse=True)
-        best = scored[0]
-        method = "corroborated"
+    unique = merge_candidates(scored)
+    best = unique[0]
+    method = ("corroborated" if best.get("score_detail", {}).get("corroborated")
+              else f"search:{best['source']}")
 
     # ISRC tie-break: only spend the extra requests when the answer is genuinely
     # in doubt, and only when we can act on the result.
@@ -329,6 +427,7 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
             and mb_best.get("ext_id") and spotify.is_configured()):
         isrc = mb_best.get("isrc") or await musicbrainz.fetch_isrc(mb_best["ext_id"])
         if isrc:
+            verified: list[dict[str, Any]] = []
             for track in await spotify.search_isrc(isrc):
                 track["isrc"] = isrc
                 s, detail = score_candidate(raw_artist, raw_title, duration, track)
@@ -338,21 +437,16 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
                 detail["score"] = round(s, 4)
                 track["score"] = s
                 track["score_detail"] = detail
-                scored.append(track)
-            scored.sort(key=lambda c: c["score"], reverse=True)
-            if scored[0].get("score_detail", {}).get("isrc_verified"):
-                best = scored[0]
-                method = "isrc"
-
-    # Deduplicate for display while preserving rank.
-    seen: set[tuple[str, str]] = set()
-    unique: list[dict[str, Any]] = []
-    for cand in scored:
-        key = (cand.get("source", ""), cand.get("ext_id", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(cand)
+                verified.append(track)
+            if verified:
+                # Re-merge rather than append: an ISRC hit is very often the
+                # same recording as the row it is confirming, and `best` must
+                # follow the merged row rather than keep pointing at the copy
+                # that was folded into it.
+                unique = merge_candidates(unique + verified)
+                best = unique[0]
+                if best.get("score_detail", {}).get("isrc_verified"):
+                    method = "isrc"
 
     confidence = best["score"]
     if confidence >= auto_accept:
@@ -367,7 +461,7 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
         confidence=confidence,
         method=method,
         best=best,
-        candidates=unique[:10],
+        candidates=unique[:MAX_CANDIDATES],
         reason="; ".join(errors),
     )
 

@@ -21,7 +21,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import Breaker, parse_retry_after
+from .backoff import GENTLE_STEPS, Breaker, parse_retry_after
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -32,13 +32,23 @@ API = "https://api.spotify.com/v1"
 # that must be taken at face value: clamping it to a shorter wait simply earns
 # another 429, and retrying the same call four times over turns one refusal into
 # minutes of dead time. See backoff.Breaker for why this is a hard stop.
+#
+# Unlike MusicBrainz, Spotify does say how long to wait, and its rolling window
+# is short - a burst that trips the quota is usually forgiven within seconds.
+# So our own floor stays small and escalates gently; a genuinely long wait comes
+# from Spotify's own Retry-After, which is still honoured in full.
 _breaker = Breaker(
-    "Spotify", "spotify_cooldown_seconds",
+    "Spotify", "spotify_cooldown_seconds", default_seconds=10.0, steps=GENTLE_STEPS,
     fallback_note="Matching continues on MusicBrainz alone until then.",
 )
 
 # Total wall-clock one search may spend across all its query spellings.
 SEARCH_BUDGET = 20.0
+
+# The same ceiling for a search a person is sitting and waiting on. Nothing here
+# should take long enough to notice, and a partial result now beats a complete
+# one after a stall.
+INTERACTIVE_BUDGET = 6.0
 
 # user-library-modify is requested but not required: it is only used to tidy
 # away the playlist the access test creates. Asking for it does not invalidate
@@ -386,8 +396,16 @@ def _parse_track(item: dict[str, Any]) -> dict[str, Any]:
 SEARCH_LIMIT_MAX = 10
 
 
-async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]]:
-    """Search tracks across plausible artist/title spellings."""
+async def search(artist: str, title: str, limit: int = 8, *,
+                 interactive: bool = False) -> list[dict[str, Any]]:
+    """Search tracks across plausible artist/title spellings.
+
+    `interactive` is for a search a user typed by hand. The variant expansion
+    exists to repair mangled *stream* metadata; when a person has just corrected
+    the fields themselves, re-guessing their spelling adds latency for results
+    that Spotify's own relevance ranking already covers. So that mode sends the
+    fielded query and the unfielded fallback, and nothing else.
+    """
     if not is_configured():
         return []
 
@@ -398,15 +416,16 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
     titles = title_variants(title) or [title]
 
     queries: list[str] = []
-    for t in titles[:2]:
-        for a in artists[:2]:
+    spellings = 1 if interactive else 2
+    for t in titles[:spellings]:
+        for a in artists[:spellings]:
             queries.append(f'track:"{t}" artist:"{a}"')
     # Unfielded fallback: Spotify's relevance ranking often rescues metadata
     # that is too mangled for the strict field syntax.
     queries.append(f"{artists[0]} {titles[0]}")
 
     seen: set[str] = set()
-    deadline = time.monotonic() + SEARCH_BUDGET
+    deadline = time.monotonic() + (INTERACTIVE_BUDGET if interactive else SEARCH_BUDGET)
     for query in queries:
         if query in seen:
             continue
@@ -431,8 +450,10 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
         # Enough alternatives for the scorer to discriminate between a real
         # match and a karaoke cut. Stopping at the first single hit would be
         # cheaper but can lock onto a cover before the reversed-name spelling
-        # ("Elfman Danny") has been tried at all.
-        if len(results) >= 3:
+        # ("Elfman Danny") has been tried at all. An interactive search runs
+        # both of its queries regardless: the second costs one request and the
+        # person doing the choosing wants alternatives, not the first answer.
+        if not interactive and len(results) >= 3:
             break
 
     return list(results.values())

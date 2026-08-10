@@ -151,8 +151,13 @@ def _store_candidates(song_id: int, candidates: list[dict[str, Any]]) -> None:
     db.execute("DELETE FROM candidates WHERE song_id = ?", (song_id,))
     rows = []
     for rank, cand in enumerate(candidates):
+        source, ext_id = cand.get("source", ""), cand.get("ext_id", "")
+        # A merged candidate carries both identities explicitly; an unmerged one
+        # only has whichever its own provider issued.
+        mbid = cand.get("mbid") or (ext_id if source == "musicbrainz" else "")
+        spotify_id = cand.get("spotify_id") or (ext_id if source == "spotify" else "")
         rows.append((
-            song_id, cand.get("source", ""), cand.get("ext_id", ""),
+            song_id, source, ext_id, mbid, spotify_id,
             cand.get("artist", ""), cand.get("title", ""), cand.get("album", ""),
             cand.get("duration"), cand.get("art_url", ""), cand.get("url", ""),
             cand.get("uri", ""), cand.get("isrc", ""), float(cand.get("score", 0)),
@@ -160,9 +165,9 @@ def _store_candidates(song_id: int, candidates: list[dict[str, Any]]) -> None:
         ))
     if rows:
         db.executemany(
-            "INSERT OR REPLACE INTO candidates (song_id, source, ext_id, artist, title, "
-            "album, duration, art_url, url, uri, isrc, score, score_detail, rank, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO candidates (song_id, source, ext_id, mbid, spotify_id, "
+            "artist, title, album, duration, art_url, url, uri, isrc, score, score_detail, "
+            "rank, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
 

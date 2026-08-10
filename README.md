@@ -71,9 +71,11 @@ Four things keep this app a well-behaved citizen of both:
 - **A meaningful User-Agent**, with a contact URL, as MusicBrainz policy requires.
 - **Honouring backpressure.** A `503` or `429` opens a per-provider cooldown: no
   further requests are sent until it expires, `Retry-After` is honoured in full,
-  and repeated throttling escalates the pause to 3×, 10× then 30× the configured
-  value. A refusal also abandons the remaining query spellings, because they
-  would each be refused too.
+  and repeated throttling escalates the pause. A refusal also abandons the
+  remaining query spellings, because they would each be refused too. How far the
+  pause escalates depends on how much the service tells us: MusicBrainz names no
+  delay, so its cooldown steps up to 3×, 10× then 30×; Spotify does, so its own
+  figure leads and our floor only steps up to 2×, 4× then 8×.
 - **Degrading instead of stalling.** One cold provider means matching continues
   on the other; the dashboard names whichever is paused, and the Activity log
   records it. Confidence is a little lower without two databases corroborating,
@@ -89,8 +91,14 @@ a healing pass in the sync loop attaches the link once Spotify answers again.
 
 **Confidence scoring** blends title (0.42), artist (0.38) and duration (0.20)
 agreement. When a duration is unavailable the weight is redistributed rather
-than guessed. Two independent databases agreeing raises confidence; a borderline
-score triggers an ISRC cross-check that resolves identity exactly.
+than guessed. A borderline score triggers an ISRC cross-check that resolves
+identity exactly.
+
+When both databases return the same recording it becomes **one** candidate, not
+two: the agreement raises its confidence, and the merged row carries MusicBrainz's
+MBID alongside Spotify's playable URI and artwork. So the ranked list is a list
+of genuinely different answers, and a MusicBrainz identification often arrives
+playable without a second lookup.
 
 Defaults: **≥ 0.92** auto-accepted, **0.62–0.92** sent to review, below that
 listed as unmatched. Both thresholds are adjustable in Settings.
@@ -204,8 +212,10 @@ configuration needed to see it working.
    </details>
 
 3. **Work the review queue** — the badge in the sidebar shows how many songs are
-   waiting. Each shows the stream metadata, a prefilled search box, ranked
-   candidates, and *why* each scored the way it did. Confirming teaches the
+   waiting. Each shows the stream metadata, a prefilled search box, the four
+   strongest candidates, and *why* each scored the way it did; weaker ones are
+   one click away under **Show more**. Correcting a field and pressing Enter
+   searches MusicBrainz and Spotify at the same time. Confirming teaches the
    matcher permanently. Anything you would rather not decide on yet can be
    **archived**: it leaves the queue without a verdict and waits in the Library
    under *archived*, where **Restore** puts it back exactly as you left it.
@@ -272,7 +282,13 @@ Two settings govern how the app treats MusicBrainz:
 |---|---|---|
 | MusicBrainz rate limit (seconds) | `1.1` | Minimum gap between MusicBrainz requests |
 | MusicBrainz cooldown (seconds) | `60` | Pause after a `503`/`429`, escalating to 3×, 10×, 30× |
-| Spotify cooldown (seconds) | `60` | The same, for Spotify's per-application quota |
+| Spotify cooldown (seconds) | `10` | Floor for Spotify's per-application quota, escalating to 2×, 4×, 8× |
+
+The two differ because the services do. MusicBrainz never says how long to wait,
+so the pause is a guess and guessing long is the safe direction. Spotify states
+its own `Retry-After` and that is honoured in full — its setting is only a floor
+to stop a tight retry loop, and its quota window is short enough that a burst is
+usually forgiven in seconds.
 
 Raising a cooldown is the right response to persistent throttling; lowering the
 rate limit below `1.0` is not, and will get the IP blocked.

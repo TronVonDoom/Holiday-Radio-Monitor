@@ -25,7 +25,15 @@ from typing import Any
 from .. import db
 
 # Multipliers applied to the configured base cooldown as throttling persists.
+# For a service that only says "503, go away" with no indication of for how long,
+# guessing long is the safe direction.
 DEFAULT_STEPS = (1, 3, 10, 30)
+
+# For a service that answers with an accurate `Retry-After`, the header already
+# carries the real answer and our own floor is only there to stop a tight
+# probe-fail-probe loop. Escalating it 30x just idles the queue long after the
+# quota window has rolled over, so these providers escalate gently instead.
+GENTLE_STEPS = (1, 2, 4, 8)
 
 
 def parse_retry_after(value: str | None) -> float | None:
@@ -90,7 +98,7 @@ class Breaker:
         Returns the delay applied, for the caller's error message.
         """
         self._streak += 1
-        base = max(5.0, db.get_float(self.setting_key, self.default_seconds))
+        base = max(1.0, db.get_float(self.setting_key, self.default_seconds))
         step = base * self.steps[min(self._streak, len(self.steps)) - 1]
         # Honour Retry-After in full when the service names a delay, but never
         # wait less than our own escalating floor.

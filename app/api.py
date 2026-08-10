@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from typing import Any
@@ -22,6 +23,10 @@ STATUSES = ("pending", "matched", "review", "unmatched", "confirmed", "archived"
 # Statuses the review queue works through, and therefore the ones a song can be
 # restored to when it comes back out of the archive.
 QUEUE_STATUSES = ("pending", "review", "unmatched")
+
+# A manual search keeps the same depth an automatic resolve does, so "load more"
+# behaves identically however the list was produced.
+CANDIDATES_STORED = matcher.MAX_CANDIDATES
 
 
 # --- models ------------------------------------------------------------------
@@ -367,8 +372,10 @@ async def confirm_song(song_id: int, payload: ConfirmIn) -> dict[str, Any]:
             "uri": cand["uri"],
             "art_url": cand["art_url"],
             "isrc": cand["isrc"],
-            "mbid": cand["ext_id"] if cand["source"] == "musicbrainz" else "",
-            "spotify_id": cand["ext_id"] if cand["source"] == "spotify" else "",
+            # A merged candidate stores both identities; rows written before the
+            # columns existed carry only the one their own provider issued.
+            "mbid": cand["mbid"] or (cand["ext_id"] if cand["source"] == "musicbrainz" else ""),
+            "spotify_id": cand["spotify_id"] or (cand["ext_id"] if cand["source"] == "spotify" else ""),
         }
     elif payload.spotify_id:
         track = await spotify.get_track(payload.spotify_id)
@@ -472,31 +479,55 @@ async def rematch_song(song_id: int) -> dict[str, Any]:
 
 @router.post("/songs/{song_id}/search")
 async def manual_search(song_id: int, payload: SearchIn) -> dict[str, Any]:
-    """Free-text search used by the review UI when the automatic candidates miss."""
+    """Free-text search used by the review UI when the automatic candidates miss.
+
+    Searches MusicBrainz and Spotify *at the same time*, in their interactive
+    mode. Running them one after the other made every manual search cost the sum
+    of both providers - dominated by MusicBrainz, whose one-request-per-second
+    budget is charged before a request is even sent - when the two share no
+    resource and the wait is the maximum of the two, not the total.
+
+    The response carries a per-provider report so a missing provider reads as
+    "Spotify is paused for 8s" rather than as a search that quietly found less.
+    """
     song = _song_or_404(song_id)
     artist = payload.artist or song["raw_artist"]
     title = payload.title or song["raw_title"]
 
-    results: list[dict[str, Any]] = []
-    if spotify.is_configured():
-        try:
-            results.extend(await spotify.search(artist, title, payload.limit))
-        except Exception as exc:  # noqa: BLE001
-            db.log_event(f"Manual Spotify search failed: {exc}", level="warn", source="review")
+    tasks: list[tuple[str, Any]] = []
     if db.get_bool("use_musicbrainz", True):
-        try:
-            results.extend(await musicbrainz.search(artist, title, payload.limit))
-        except Exception as exc:  # noqa: BLE001
-            db.log_event(f"Manual MusicBrainz search failed: {exc}", level="warn", source="review")
+        tasks.append(("MusicBrainz",
+                      musicbrainz.search(artist, title, payload.limit, interactive=True)))
+    if db.get_bool("use_spotify", True) and spotify.is_configured():
+        tasks.append(("Spotify",
+                      spotify.search(artist, title, payload.limit, interactive=True)))
+
+    gathered = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
+
+    results: list[dict[str, Any]] = []
+    providers: list[dict[str, Any]] = []
+    for (name, _), outcome in zip(tasks, gathered):
+        if isinstance(outcome, BaseException):
+            db.log_event(f"Manual {name} search failed: {outcome}",
+                         level="warn", source="review")
+            providers.append({"name": name, "ok": False, "count": 0,
+                              "detail": str(outcome)[:200]})
+            continue
+        results.extend(outcome)
+        providers.append({"name": name, "ok": True, "count": len(outcome), "detail": ""})
 
     scored = []
     for cand in results:
         score, detail = matcher.score_candidate(artist, title, song["duration"], cand)
         scored.append({**cand, "score": score, "score_detail": detail})
-    scored.sort(key=lambda c: c["score"], reverse=True)
 
-    monitor._store_candidates(song_id, scored[:12])
-    return get_song(song_id)
+    # Same merge the automatic matcher uses, so one recording found in both
+    # databases is one row that is both playable and canonically identified -
+    # not two rows competing for the top of the list.
+    merged = matcher.merge_candidates(scored)
+
+    monitor._store_candidates(song_id, merged[:CANDIDATES_STORED])
+    return {**get_song(song_id), "providers": providers}
 
 
 @router.post("/match/run")

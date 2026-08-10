@@ -44,6 +44,12 @@ REQUEST_TIMEOUT = 8.0
 # multiply by the number of variants and blow the caller's per-song ceiling.
 SEARCH_BUDGET = 20.0
 
+# The same ceiling for a search a person is waiting on. Every extra spelling
+# costs a full second of the shared rate budget before the request even leaves,
+# so an interactive search is the one place where four spellings is the
+# difference between "instant" and "did that do anything?".
+INTERACTIVE_BUDGET = 6.0
+
 
 class ProviderUnavailable(RuntimeError):
     """Raised when the service could not be reached, as opposed to finding nothing."""
@@ -215,11 +221,18 @@ def _parse_recording(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]]:
+async def search(artist: str, title: str, limit: int = 8, *,
+                 interactive: bool = False) -> list[dict[str, Any]]:
     """Search recordings across plausible artist/title spellings.
 
     Queries the strongest artist/title combination first and stops as soon as a
     variant returns results, so the common case costs a single request.
+
+    `interactive` is for a search a user typed by hand. Variant expansion is
+    there to repair mangled stream metadata; a person who has just corrected the
+    fields does not need us to guess at their spelling, and each guess costs a
+    second of the shared rate budget while they wait. So that mode sends one
+    precise query and, only if it finds nothing, the title-only rescue.
     """
     results: dict[str, dict[str, Any]] = {}
     artists = artist_variants(artist) or [artist]
@@ -229,13 +242,14 @@ async def search(artist: str, title: str, limit: int = 8) -> list[dict[str, Any]
     # spellings, best guess first. Capped at 2x2 rather than 2x3 - every extra
     # variant costs a full second of the shared rate budget, and the third
     # artist form is a long shot that the title-only rescue below covers anyway.
+    spellings = 1 if interactive else 2
     attempts: list[tuple[str, str]] = [
-        (a, t) for t in titles[:2] for a in artists[:2] if t
+        (a, t) for t in titles[:spellings] for a in artists[:spellings] if t
     ]
 
     seen_queries: set[str] = set()
     any_success = False
-    deadline = time.monotonic() + SEARCH_BUDGET
+    deadline = time.monotonic() + (INTERACTIVE_BUDGET if interactive else SEARCH_BUDGET)
 
     for a, t in attempts:
         query = f'recording:"{_lucene_escape(t)}" AND artist:"{_lucene_escape(a)}"'

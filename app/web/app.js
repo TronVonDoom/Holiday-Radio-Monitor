@@ -169,6 +169,8 @@ const state = {
   stats: null,
   reviewIndex: 0,
   reviewQueue: [],
+  candidatesShown: 0,     // grows when "show more" is used; reset per card
+  searchProviders: null,  // per-provider report from the last manual search
   archivedCount: 0,
   library: { status: "", q: "", sort: "recent", page: 1 },
   stationsPage: 1,
@@ -265,7 +267,57 @@ async function renderDashboard() {
 
 /* ---------- review ---------- */
 
+/* The list shows a handful of strong options rather than everything the
+   providers returned. A ranked list is only useful as far down as anyone
+   actually reads it, and a dozen rows of near-misses is how the confident answer
+   at the top gets second-guessed. The rest are already loaded, so revealing them
+   is free. */
+const TOP_CANDIDATES = 4;
+
+/* Card details are fetched once per song and kept, so paging back and forth
+   through the queue does not re-request what it just had. The neighbours are
+   warmed in the background, which is what makes Next feel like a page turn
+   rather than a round trip. */
+const detailCache = new Map();
+
+function songDetail(id) {
+  if (!detailCache.has(id)) {
+    // A rejected promise must not stay in the cache, or one transient failure
+    // becomes a permanently broken card.
+    detailCache.set(id, api(`/songs/${id}`).catch((err) => {
+      detailCache.delete(id);
+      throw err;
+    }));
+  }
+  return detailCache.get(id);
+}
+
+function prefetchNeighbours() {
+  const q = state.reviewQueue;
+  if (q.length < 2) return;
+  for (const offset of [1, -1]) {
+    const song = q[(state.reviewIndex + offset + q.length) % q.length];
+    if (song && !detailCache.has(song.id)) songDetail(song.id).catch(() => {});
+  }
+}
+
+/* Move to another item in the queue. Both per-card view settings reset here so
+   the next card opens in its default shape rather than inheriting the last
+   one's. */
+function goToCard(index) {
+  state.reviewIndex = index;
+  state.candidatesShown = TOP_CANDIDATES;
+  state.searchProviders = null;
+  return renderReviewCard();
+}
+
 async function renderReview() {
+  // Entering the tab is the one moment a cached card can be out of date: the
+  // matcher may have resolved something in the background since it was read.
+  detailCache.clear();
+  state.candidatesShown = TOP_CANDIDATES;
+  state.searchProviders = null;
+
   // The archive is only a count here; the list itself is the Library filtered to
   // it, which already has search, sorting and paging.
   const [data, archived] = await Promise.all([
@@ -293,15 +345,16 @@ const archiveButton = () => state.archivedCount
   ? `<button class="btn ghost sm" id="rv-archived">Archived (${state.archivedCount})</button>`
   : "";
 
-async function renderReviewCard() {
+async function renderReviewCard(prefetched) {
   const song = state.reviewQueue[state.reviewIndex];
   if (!song) return renderReview();
 
-  const detail = await api(`/songs/${song.id}`);
+  const detail = prefetched || await songDetail(song.id);
   const s = detail.song;
   const cands = detail.candidates;
+  const shown = Math.min(Math.max(state.candidatesShown, TOP_CANDIDATES), cands.length);
 
-  const candHtml = cands.length ? cands.map((c, i) => {
+  const candRow = (c, i) => {
     const d = c.score_detail || {};
     const sig = [];
     const mark = (v) => v >= 0.9 ? "good" : v >= 0.6 ? "warn" : "bad";
@@ -312,7 +365,8 @@ async function renderReviewCard() {
     if (d.corroborated) sig.push(`<span class="sig good">both databases agree</span>`);
     if (d.isrc_verified) sig.push(`<span class="sig good">ISRC verified</span>`);
     (d.penalties || []).forEach((p) => sig.push(`<span class="sig bad">${esc(p)}</span>`));
-    sig.push(`<span class="sig">${esc(c.source)}</span>`);
+    // A merged row was found in both databases, so it names both.
+    sig.push(`<span class="sig">${esc((d.sources?.length ? d.sources : [c.source]).join(" + "))}</span>`);
 
     return `
       <div class="cand ${i === 0 ? "best" : ""}">
@@ -328,9 +382,24 @@ async function renderReviewCard() {
           <button class="btn sm" data-confirm="${c.id}" data-song="${s.id}">Use this</button>
         </div>
       </div>`;
-  }).join("") : `<div class="muted" style="padding:.5rem 0">
+  };
+
+  const hidden = cands.length - shown;
+  const candHtml = cands.length ? cands.slice(0, shown).map(candRow).join("") + (hidden > 0
+    ? `<button class="btn ghost sm" id="rv-more" style="width:100%;margin-top:.2rem">
+         Show ${hidden} weaker match${hidden === 1 ? "" : "es"}</button>`
+    : "") : `<div class="muted" style="padding:.5rem 0">
       No candidates were found. Correct the artist or title above and search again,
       archive it for later, or mark it as not-a-song.</div>`;
+
+  // Which providers actually answered the last manual search. Without it a
+  // provider sitting in a cooldown reads as a search that simply found less.
+  const providerNote = state.searchProviders?.length
+    ? `<p class="sub">${state.searchProviders.map((p) => p.ok
+        ? `${esc(p.name)}: ${p.count} result${p.count === 1 ? "" : "s"}`
+        : `<span class="warn-text">${esc(p.name)}: ${esc(p.detail || "unavailable")}</span>`
+      ).join(" · ")}</p>`
+    : "";
 
   $("#view-review").innerHTML = `
     <div class="review-head">
@@ -357,8 +426,8 @@ async function renderReviewCard() {
 
     <div class="card" style="margin-bottom:1rem">
       <h2>Search</h2>
-      <p class="sub">Prefilled with what the stream said. Correct either field and search
-        MusicBrainz and Spotify again — results replace the list below.</p>
+      <p class="sub">Prefilled with what the stream said. Correct either field and press
+        Enter to search MusicBrainz and Spotify together — results replace the list below.</p>
       <div class="row">
         <div class="field"><label>Artist</label>
           <input type="text" id="ms-artist" value="${esc(s.raw_artist)}"></div>
@@ -376,14 +445,53 @@ async function renderReviewCard() {
     <div class="card" id="rv-matches">
       <h2>Suggested matches</h2>
       <p class="sub">Ranked by artist, title and track-length agreement. Confirming also teaches the matcher, so this track resolves instantly next time.</p>
+      ${providerNote}
       ${candHtml}
     </div>`;
+
+  prefetchNeighbours();
 }
 
 /* A search rewrites the card from the top, which would leave its own results off
    screen — so bring them back into view. */
 const showMatches = () =>
   $("#rv-matches")?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+/* Both search endpoints return the whole refreshed card, so the result is shown
+   from the response the search already produced rather than by asking for the
+   same song again. */
+async function showSearchResult(songId, detail) {
+  detailCache.set(songId, Promise.resolve(detail));
+  state.searchProviders = detail.providers || null;
+  state.candidatesShown = TOP_CANDIDATES;
+  await renderReviewCard(detail);
+  showMatches();
+}
+
+/* Drop the item just decided on and land on whatever takes its place — the queue
+   closes up behind it, so that is the next item without any navigation. */
+function removeCurrentCard(songId) {
+  detailCache.delete(songId);
+  state.reviewQueue.splice(state.reviewIndex, 1);
+  if (!state.reviewQueue.length) return renderReview();
+  return goToCard(Math.min(state.reviewIndex, state.reviewQueue.length - 1));
+}
+
+async function runManualSearch(button, songId) {
+  const artist = $("#ms-artist").value;
+  const title = $("#ms-title").value;
+  button.disabled = true;
+  button.textContent = "Searching…";
+  try {
+    await showSearchResult(songId, await api(`/songs/${songId}/search`, {
+      method: "POST", body: { artist, title },
+    }));
+  } catch (e) {
+    toast(e.message, "bad");
+    button.disabled = false;
+    button.textContent = "Search";
+  }
+}
 
 /* ---------- library ---------- */
 
@@ -612,13 +720,14 @@ async function renderSettings() {
           <div class="row">
             <div class="field"><label>MusicBrainz cooldown (seconds)</label>
               <input type="number" id="s-mbcool" value="${esc(v.musicbrainz_cooldown_seconds)}">
-              <span class="hint">How long to stop calling a provider after it asks us to
-                slow down. Escalates to 3×, 10× and 30× if throttling continues;
-                matching falls back to the other provider meanwhile.</span></div>
+              <span class="hint">How long to stop calling MusicBrainz after it asks us to
+                slow down. It never says for how long, so this escalates to 3×, 10× and
+                30× if throttling continues; matching falls back to Spotify meanwhile.</span></div>
             <div class="field"><label>Spotify cooldown (seconds)</label>
               <input type="number" id="s-spcool" value="${esc(v.spotify_cooldown_seconds)}">
-              <span class="hint">Spotify's quota is per application, so this throttle
-                follows the matcher rather than your network.</span></div>
+              <span class="hint">Only a floor: Spotify states its own wait and that is
+                honoured in full when it is longer. Escalates to 2×, 4× and 8× while
+                throttling continues.</span></div>
           </div>
           <div class="row">
             <label class="switch"><input type="checkbox" id="s-m3u" ${v.m3u_enabled === "1" ? "checked" : ""}> Write .m3u8 files</label>
@@ -753,7 +862,7 @@ document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-archive],[data-unarchive]," +
     "[data-nonsong],[data-rematch]," +
     "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
-    "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
+    "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-more,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
     "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
   if (!t) return;
 
@@ -792,8 +901,7 @@ document.addEventListener("click", async (ev) => {
     try {
       await api(`/songs/${d.song}/confirm`, { method: "POST", body: { candidate_id: +d.confirm } });
       toast("Confirmed and remembered", "ok");
-      state.reviewQueue.splice(state.reviewIndex, 1);
-      await (state.reviewQueue.length ? renderReviewCard() : renderReview());
+      await removeCurrentCard(+d.song);
     } catch (e) { toast(e.message, "bad"); t.disabled = false; }
     return;
   }
@@ -802,8 +910,7 @@ document.addEventListener("click", async (ev) => {
     try {
       await api(`/songs/${d.nonsong}/nonsong?remember=true`, { method: "POST" });
       toast("Marked as station imaging", "ok");
-      state.reviewQueue.splice(state.reviewIndex, 1);
-      await (state.reviewQueue.length ? renderReviewCard() : renderReview());
+      await removeCurrentCard(+d.nonsong);
     } catch (e) { toast(e.message, "bad"); }
     return;
   }
@@ -813,8 +920,7 @@ document.addEventListener("click", async (ev) => {
       await api(`/songs/${d.archive}/archive`, { method: "POST" });
       state.archivedCount += 1;
       toast("Archived — restore it any time from the Library", "ok");
-      state.reviewQueue.splice(state.reviewIndex, 1);
-      await (state.reviewQueue.length ? renderReviewCard() : renderReview());
+      await removeCurrentCard(+d.archive);
     } catch (e) { toast(e.message, "bad"); }
     return;
   }
@@ -837,30 +943,26 @@ document.addEventListener("click", async (ev) => {
 
   if (d.rematch) {
     t.disabled = true; t.textContent = "Searching…";
-    try { await api(`/songs/${d.rematch}/rematch`, { method: "POST" }); await renderReviewCard(); showMatches(); }
-    catch (e) { toast(e.message, "bad"); }
-    return;
-  }
-
-  if (t.id === "ms-go") {
-    t.disabled = true; t.textContent = "Searching…";
     try {
-      await api(`/songs/${d.song}/search`, {
-        method: "POST",
-        body: { artist: $("#ms-artist").value, title: $("#ms-title").value },
-      });
-      await renderReviewCard();
-      showMatches();
-    } catch (e) { toast(e.message, "bad"); t.disabled = false; t.textContent = "Search"; }
+      // Both endpoints answer with the refreshed card, so re-rendering from the
+      // response costs no second round trip.
+      await showSearchResult(+d.rematch,
+        await api(`/songs/${d.rematch}/rematch`, { method: "POST" }));
+    } catch (e) { toast(e.message, "bad"); t.disabled = false; t.textContent = "Run auto-match again"; }
     return;
   }
 
-  if (t.id === "rv-prev") {
-    state.reviewIndex = Math.max(0, state.reviewIndex - 1);
-    return renderReviewCard();
-  }
+  if (t.id === "ms-go") return runManualSearch(t, +d.song);
+
+  if (t.id === "rv-prev") return goToCard(Math.max(0, state.reviewIndex - 1));
   if (t.id === "rv-next") {
-    state.reviewIndex = (state.reviewIndex + 1) % state.reviewQueue.length;
+    return goToCard((state.reviewIndex + 1) % state.reviewQueue.length);
+  }
+
+  // Everything below the cut is already loaded, so this is a re-render, not a
+  // fetch.
+  if (t.id === "rv-more") {
+    state.candidatesShown = Infinity;
     return renderReviewCard();
   }
 
@@ -1036,6 +1138,16 @@ document.addEventListener("change", async (ev) => {
     toast(el.checked ? "Station enabled" : "Station paused");
   }
   if (el.id === "lib-sort") { state.library.sort = el.value; state.library.page = 1; renderLibrary(); }
+});
+
+/* Correcting a field and pressing Enter is the natural way to run the review
+   search; reaching for the button after typing is not. */
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  if (ev.target.id !== "ms-artist" && ev.target.id !== "ms-title") return;
+  ev.preventDefault();
+  const button = $("#ms-go");
+  if (button && !button.disabled) runManualSearch(button, +button.dataset.song);
 });
 
 let searchTimer;

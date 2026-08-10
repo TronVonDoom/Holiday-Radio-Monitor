@@ -104,6 +104,11 @@ CREATE TABLE IF NOT EXISTS candidates (
     song_id       INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
     source        TEXT NOT NULL,          -- musicbrainz | spotify
     ext_id        TEXT NOT NULL,
+    -- Both identities, because a candidate can be the merge of the same
+    -- recording found in both databases: the MBID is the canonical identity and
+    -- the Spotify id is the playable one, and confirming needs to keep both.
+    mbid          TEXT,
+    spotify_id    TEXT,
     artist        TEXT NOT NULL DEFAULT '',
     title         TEXT NOT NULL DEFAULT '',
     album         TEXT NOT NULL DEFAULT '',
@@ -216,6 +221,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(songs)")}
     if "archived_from" not in columns:
         conn.execute("ALTER TABLE songs ADD COLUMN archived_from TEXT")
+
+    cand_columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
+    for column in ("mbid", "spotify_id"):
+        if column not in cand_columns:
+            conn.execute(f"ALTER TABLE candidates ADD COLUMN {column} TEXT")
+
+    # Spotify's cooldown floor used to match MusicBrainz's 60s and escalate to
+    # 30x it. Spotify sends an accurate Retry-After, so that floor was pure dead
+    # time on top of the wait Spotify actually asked for - half an hour of it at
+    # the top step. Only rewrite the value if it is still the old default; a
+    # figure the user chose themselves is theirs to keep.
+    if "migrated_spotify_cooldown_floor" not in done:
+        conn.execute(
+            "UPDATE settings SET value = ? WHERE key = 'spotify_cooldown_seconds' "
+            "AND value = '60'", (config.DEFAULT_SETTINGS["spotify_cooldown_seconds"],)
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('migrated_spotify_cooldown_floor', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
 
     # play_count used to be incremented once per *observation*. Because AzuraCast
     # serves a rolling history window, a single play was counted on every poll it
