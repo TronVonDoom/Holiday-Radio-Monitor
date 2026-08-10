@@ -96,8 +96,17 @@ async def sync_spotify(station: dict[str, Any]) -> dict[str, Any]:
 
     entries = station_entries(int(station["id"]))
     wanted = [e for e in entries if e["spotify_uri"]]
-    if not wanted:
-        return {"ok": True, "added": 0, "reason": "Nothing to add."}
+
+    # Nothing undelivered means nothing to ask Spotify about. This test used to
+    # be `if not wanted`, which counted entries already in the playlist - so once
+    # a station had ever synced one track it never took the early exit again,
+    # and every pass re-read the whole playlist to rediscover that there was
+    # nothing to do. At 50 tracks per page, one station per two minutes, that is
+    # thousands of pointless requests a day against an application-wide quota,
+    # which is what got the whole app rate limited for hours at a time.
+    if not any(not e["spotify_synced"] for e in wanted):
+        return {"ok": True, "added": 0, "reason": "Nothing new to add.",
+                "total": len(wanted)}
 
     playlist_id = await spotify.ensure_playlist(
         station["spotify_playlist_id"] or "",
@@ -198,13 +207,21 @@ def _report(station: dict[str, Any], result: dict[str, Any]) -> None:
 
 
 async def sync_all() -> list[dict[str, Any]]:
-    """Sync only stations that actually have undelivered work."""
+    """Sync only stations that actually have undelivered *deliverable* work.
+
+    A song identified through MusicBrainz alone has no Spotify URI, so its entry
+    can never be marked spotify_synced - there is nothing to send. Counting those
+    as outstanding work made every station permanently pending, so the loop woke
+    all of them every two minutes forever. The URI test is what makes "pending"
+    mean deliverable rather than merely imperfect.
+    """
     pending = db.query(
         "SELECT DISTINCT st.* FROM stations st "
         "JOIN playlist_entries e ON e.station_id = st.id "
         "JOIN songs s ON s.id = e.song_id "
         "WHERE s.status IN ('matched', 'confirmed') "
-        "AND (e.spotify_synced = 0 OR e.m3u_synced = 0)"
+        "AND ((e.spotify_synced = 0 AND COALESCE(s.spotify_uri, '') != '') "
+        "     OR e.m3u_synced = 0)"
     )
     results = []
     for row in pending:

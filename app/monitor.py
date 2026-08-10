@@ -352,6 +352,17 @@ async def _match_loop() -> None:
 # cannot turn into a burst of Spotify calls.
 LINK_BATCH = 5
 
+# Backoff between attempts at the same song: 10 minutes, doubling, settling at a
+# day. Plenty of correctly identified songs are simply not on Spotify, and the
+# pass has no way to tell those from ones Spotify has not indexed yet. Without a
+# memory of having tried, `ORDER BY play_count DESC LIMIT 5` handed back the
+# same five most-played unlinkable songs every two minutes and searched them
+# again - a few hundred requests an hour, forever, against an application-wide
+# quota, achieving nothing. Converging on daily keeps the door open at a cost of
+# roughly one search per song per day.
+LINK_BACKOFF_BASE = 600
+LINK_BACKOFF_MAX = 86400
+
 
 async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
     """Attach a Spotify URI to correct matches that do not have one yet.
@@ -369,12 +380,23 @@ async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
     songs = [dict(r) for r in db.query(
         "SELECT * FROM songs WHERE status IN ('matched', 'confirmed') "
         "AND (spotify_uri IS NULL OR spotify_uri = '') "
+        "AND (link_after IS NULL OR link_after <= ?) "
         "ORDER BY play_count DESC LIMIT ?",
-        (limit,),
+        (db.now(), limit),
     )]
 
     linked = 0
     for song in songs:
+        # Record the attempt before making it, so a song that throws, times out
+        # or simply is not on Spotify still backs off rather than being retried
+        # on the very next pass.
+        attempts = int(song["link_attempts"] or 0) + 1
+        db.execute(
+            "UPDATE songs SET link_attempts = ?, link_after = ? WHERE id = ?",
+            (attempts,
+             db.now() + min(LINK_BACKOFF_BASE * 2 ** (attempts - 1), LINK_BACKOFF_MAX),
+             song["id"]),
+        )
         candidate = {
             "source": "musicbrainz" if song["mbid"] else "",
             "artist": song["match_artist"] or song["raw_artist"],
@@ -398,7 +420,8 @@ async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
         db.execute(
             "UPDATE songs SET spotify_id = ?, spotify_uri = ?, spotify_url = ?, "
             "isrc = COALESCE(NULLIF(?, ''), isrc), "
-            "match_art_url = COALESCE(NULLIF(match_art_url, ''), NULLIF(?, '')) "
+            "match_art_url = COALESCE(NULLIF(match_art_url, ''), NULLIF(?, '')), "
+            "link_attempts = 0, link_after = NULL "
             "WHERE id = ?",
             (merged.get("spotify_id"), merged.get("uri"), merged.get("url"),
              merged.get("isrc") or "", merged.get("art_url") or "", song["id"]),

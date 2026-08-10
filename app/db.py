@@ -78,6 +78,11 @@ CREATE TABLE IF NOT EXISTS songs (
     spotify_url     TEXT,
     match_art_url   TEXT,
     nonsong_reason  TEXT,
+    -- Backoff for the Spotify-link healing pass. A song that is simply not on
+    -- Spotify can never be linked, and without a memory of having tried, the
+    -- pass re-searches the same few every couple of minutes forever.
+    link_attempts   INTEGER NOT NULL DEFAULT 0,
+    link_after      INTEGER,
     play_count      INTEGER NOT NULL DEFAULT 0,
     first_seen_at   INTEGER NOT NULL,
     last_seen_at    INTEGER NOT NULL,
@@ -221,6 +226,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(songs)")}
     if "archived_from" not in columns:
         conn.execute("ALTER TABLE songs ADD COLUMN archived_from TEXT")
+    if "link_attempts" not in columns:
+        conn.execute("ALTER TABLE songs ADD COLUMN link_attempts INTEGER NOT NULL DEFAULT 0")
+    if "link_after" not in columns:
+        conn.execute("ALTER TABLE songs ADD COLUMN link_after INTEGER")
 
     cand_columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)")}
     for column in ("mbid", "spotify_id"):
