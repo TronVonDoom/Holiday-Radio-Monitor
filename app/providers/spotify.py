@@ -552,9 +552,13 @@ async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
                                       params={"fields": "id"})
             if existing.get("id"):
                 return existing["id"]
-        except SpotifyError:
-            # Deleted or no longer accessible - fall through and make a new one.
-            pass
+        except SpotifyError as exc:
+            # Only a 404 means the playlist is genuinely gone. Treating every
+            # failure as "make another one" turns a cooldown, a 403 or a
+            # transient 5xx into a duplicate playlist on the account - and buries
+            # the real error behind whatever the create attempt reports instead.
+            if exc.status != 404:
+                raise
 
     missing = missing_scopes()
     if missing:

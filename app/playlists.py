@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,46 @@ async def sync_station(station: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# Last problem reported per station, so a sync that keeps failing says so once
+# instead of every two minutes - which would bury the 500-entry log in one
+# repeated line and evict everything else worth reading.
+_reported: dict[int, tuple[str, float]] = {}
+RELOG_AFTER = 1800.0
+
+
+def _report(station: dict[str, Any], result: dict[str, Any]) -> None:
+    """Log a background sync outcome, but only when it is worth reading.
+
+    The background loop used to discard everything sync_station returned, so a
+    Spotify delivery that had been failing every two minutes for weeks - expired
+    login, missing scope, 403, an open cooldown - was completely silent. The
+    manual Sync button surfaced the reason in a toast, and nothing else ever did,
+    which is how "not syncing" goes unnoticed for a long time.
+    """
+    station_id = int(station["id"])
+    for target in ("spotify", "m3u"):
+        outcome = result.get(target)
+        if not outcome or outcome.get("ok"):
+            continue
+        reason = str(outcome.get("reason") or "unknown error")
+        key = f"{target}:{reason}"
+        last, when = _reported.get(station_id, ("", 0.0))
+        if key == last and (time.monotonic() - when) < RELOG_AFTER:
+            return  # same problem as last time, and said recently enough
+        _reported[station_id] = (key, time.monotonic())
+        label = "Spotify" if target == "spotify" else "M3U"
+        db.log_event(
+            f"{station['name']}: {label} delivery is failing — {reason}",
+            level="warn", source="sync",
+        )
+        return
+
+    # Back to healthy: say so once, so the log shows the problem ending.
+    if _reported.pop(station_id, None):
+        db.log_event(f"{station['name']}: playlist delivery is working again.",
+                     source="sync")
+
+
 async def sync_all() -> list[dict[str, Any]]:
     """Sync only stations that actually have undelivered work."""
     pending = db.query(
@@ -165,7 +206,13 @@ async def sync_all() -> list[dict[str, Any]]:
         "WHERE s.status IN ('matched', 'confirmed') "
         "AND (e.spotify_synced = 0 OR e.m3u_synced = 0)"
     )
-    return [await sync_station(dict(row)) for row in pending]
+    results = []
+    for row in pending:
+        station = dict(row)
+        result = await sync_station(station)
+        _report(station, result)
+        results.append(result)
+    return results
 
 
 def playlist_dir_status() -> dict[str, Any]:
