@@ -44,12 +44,20 @@ async def aclose() -> None:
 
 @dataclass
 class Observation:
+    """One "this played" report, in whatever detail the source could give.
+
+    Carries no source-side identifier on purpose. AzuraCast offers one and it
+    was used as the song's identity, which quietly gave every station - and
+    every spelling of the metadata - its own copy of the same song. Identity is
+    derived from the normalized artist and title instead; see
+    `normalize.fingerprint` for the full account.
+    """
+
     artist: str
     title: str
     album: str = ""
     duration: int | None = None
     played_at: int = 0
-    external_id: str = ""
     art_url: str = ""
     is_current: bool = False
 
@@ -164,7 +172,6 @@ def _parse_azuracast_song(song: dict[str, Any], duration: int | None,
         album=(song.get("album") or "").strip(),
         duration=duration if duration and duration > 0 else None,
         played_at=played_at,
-        external_id=(song.get("id") or "").strip(),
         art_url=(song.get("art") or "").strip(),
         is_current=is_current,
     )

@@ -225,15 +225,43 @@ def detect_nonsong(artist: str, title: str, album: str, duration: int | None,
     return None
 
 
-def fingerprint(artist: str, title: str, external_id: str = "") -> str:
+def fingerprint(artist: str, title: str) -> str:
     """Stable identity for a piece of stream metadata.
 
-    Prefers the provider's own hash when available, otherwise derives one from
-    the normalized artist/title so the same song reported with slightly
-    different casing collapses to a single row.
+    Derived from the normalized artist and title, and from nothing else.
+
+    This used to prefer the source's own identifier when one was offered -
+    AzuraCast supplies an MD5 per song - on the reasoning that a hash from the
+    horse's mouth beats one we derive. That was backwards, and it was how the
+    library filled up with the same song several times over.
+
+    The whole reason `norm_key` exists is that this metadata is inconsistent:
+    `The purple people eater` one day and `The Purple People Eater` the next,
+    surnames reversed, decoration appended. AzuraCast hashes the raw text, so
+    every one of those spellings is a different id - and taking the id as the
+    identity skipped the normalization that was built to see through exactly
+    that. The app knew the two were the same song and then filed them
+    separately anyway.
+
+    Two further cases are structural rather than cosmetic:
+
+      * A station reached over plain Icecast or ICY offers no identifier at all,
+        so the same song heard there produced a text-derived key while an
+        AzuraCast station produced a hash. Two rows, always.
+      * Identifiers from two different AzuraCast installations share no
+        namespace whatsoever, so any station added from a second server
+        duplicated everything it had in common with the first.
+
+    (The hash covers more than the artist and title - a station's `album` field
+    is often its own domain, `www.halloweenradio.net`, which differs per station
+    on a shared network - so metadata this app already discards as junk could
+    still split one recording into several rows.)
+
+    `songs` is one global table spanning every station, so its identity has to
+    be something every station agrees on. The normalized artist and title are
+    the only such thing. Being more collapsing than the source's own hash is the
+    point: two spellings of one song *should* be one row.
     """
-    if external_id:
-        return f"ext:{external_id}"
     key = f"{norm_key(artist)}\x1f{norm_key(title)}"
     return "key:" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
 

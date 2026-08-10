@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from . import config, db, matcher, monitor, playlists, providers, sources
 from .normalize import norm_key, titlecase_display
 from .providers import musicbrainz, spotify
+from .providers.spotify import SpotifyAuthRequired, SpotifyError
 
 router = APIRouter(prefix="/api")
 
@@ -576,6 +577,23 @@ def playlist_overview() -> list[dict[str, Any]]:
 def playlist_tracks(station_id: int) -> list[dict[str, Any]]:
     _station_or_404(station_id)
     return playlists.station_entries(station_id)
+
+
+@router.post("/playlists/{station_id}/dedupe")
+async def dedupe_playlist(station_id: int) -> dict[str, Any]:
+    """Clean repeated tracks out of one station's Spotify playlist.
+
+    Deliberately manual. It removes and re-adds the duplicated tracks, which
+    moves them to the end of the playlist, so it happens when the user asks for
+    it rather than quietly during a background sync.
+    """
+    station = _station_or_404(station_id)
+    try:
+        return await playlists.dedupe_spotify(station)
+    except SpotifyAuthRequired as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except SpotifyError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @router.post("/playlists/sync")

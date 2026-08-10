@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, db
+from .normalize import norm_key
 from .providers import spotify
 from .providers.spotify import SpotifyAuthRequired, SpotifyError
 
@@ -55,11 +56,22 @@ def write_m3u(station: dict[str, Any]) -> tuple[int, str]:
 
     lines = ["#EXTM3U", f"#PLAYLIST:{station['name']}"]
     written = 0
+    # Two song rows can resolve to one recording - the stream spells it
+    # differently on different days, or two stations tag it differently - and
+    # each carries its own playlist entry. That is one track, so it is one line.
+    seen: set[str] = set()
     for song in entries:
         artist = song["match_artist"] or song["raw_artist"]
         title = song["match_title"] or song["raw_title"]
         duration = song["match_duration"] or song["duration"] or -1
         location = song["spotify_url"] or song["spotify_uri"] or ""
+
+        # Identity is the playable location where there is one; an identified
+        # song with nowhere to point is deduplicated on what it was identified as.
+        key = location or f"{norm_key(artist)}\x1f{norm_key(title)}"
+        if key in seen:
+            continue
+        seen.add(key)
 
         lines.append(f"#EXTINF:{duration},{artist} - {title}")
         if song["match_album"]:
@@ -141,25 +153,98 @@ async def sync_spotify(station: dict[str, Any]) -> dict[str, Any]:
         db.execute("UPDATE stations SET spotify_reconciled_at = ? WHERE id = ?",
                    (db.now(), station["id"]))
 
+    # What we have already sent for this station, by *track* rather than by song
+    # row. Two rows resolving to the same recording is normal - the stream
+    # spells a song differently on different days - and each one gets its own
+    # playlist entry, so `unsent` can legitimately contain a track that is
+    # already in the playlist. Without this the second row was sent as a new
+    # track and the playlist grew a duplicate. The reconcile read above would
+    # eventually notice, but it only runs every six hours, so between reads
+    # every such pair became a duplicate. This costs no requests: it is our own
+    # record of what we sent.
+    delivered = {
+        row["spotify_uri"] for row in db.query(
+            "SELECT DISTINCT s.spotify_uri FROM playlist_entries e "
+            "JOIN songs s ON s.id = e.song_id "
+            "WHERE e.station_id = ? AND e.spotify_synced = 1 "
+            "AND COALESCE(s.spotify_uri, '') != ''",
+            (station["id"],),
+        )
+    }
+
     to_add: list[str] = []
     seen: set[str] = set()
     for entry in unsent:
         uri = entry["spotify_uri"]
-        if uri in existing or uri in seen:
+        if uri in existing or uri in delivered or uri in seen:
             continue
         seen.add(uri)
         to_add.append(uri)
 
     added = await spotify.add_tracks(playlist_id, to_add) if to_add else 0
 
+    # Marks the skipped duplicates delivered too, which is exactly right: their
+    # track is in the playlist, so there is nothing left to send for them.
     db.execute(
         "UPDATE playlist_entries SET spotify_synced = 1 WHERE station_id = ? AND song_id IN "
-        "(SELECT id FROM songs WHERE spotify_uri IS NOT NULL)",
+        "(SELECT id FROM songs WHERE COALESCE(spotify_uri, '') != '')",
         (station["id"],),
     )
     if added:
         db.log_event(f"{station['name']}: added {added} track(s) to Spotify", source="sync")
     return {"ok": True, "added": added, "playlist_id": playlist_id, "total": len(wanted)}
+
+
+async def dedupe_spotify(station: dict[str, Any]) -> dict[str, Any]:
+    """Remove repeated tracks from a station's Spotify playlist.
+
+    Sync stopped *creating* duplicates, but a playlist that collected them under
+    the old behaviour stays duplicated until something goes and cleans it, and
+    the reconcile read cannot: it only ever answers "is this URI present", which
+    is true either way.
+
+    Spotify has no "remove one copy" that is safe to rely on here - its removal
+    endpoint takes URIs and clears every occurrence of each - so a duplicated
+    track is removed outright and added back exactly once. That costs the track
+    its position: deduplicated tracks end up at the end of the playlist. For a
+    playlist this app generates and orders by when it found each song, that is a
+    fair trade for it being correct, and it is why this runs when asked rather
+    than on its own.
+
+    Never touches a track that appears once, so nothing the user added by hand
+    is disturbed unless they added a second copy of something.
+    """
+    if not spotify.is_configured() or not spotify.is_user_linked():
+        return {"ok": False, "reason": "Spotify is not connected."}
+
+    playlist_id = station["spotify_playlist_id"] or ""
+    if not playlist_id:
+        return {"ok": False, "reason": "This station has no Spotify playlist yet."}
+
+    uris = await spotify.playlist_track_uri_list(playlist_id)
+    counts: dict[str, int] = {}
+    for uri in uris:
+        counts[uri] = counts.get(uri, 0) + 1
+    duplicated = [uri for uri, n in counts.items() if n > 1]
+    if not duplicated:
+        return {"ok": True, "removed": 0, "tracks": len(uris),
+                "reason": "No duplicates to remove."}
+
+    await spotify.remove_tracks(playlist_id, duplicated)
+    await spotify.add_tracks(playlist_id, duplicated)
+
+    removed = sum(counts[uri] - 1 for uri in duplicated)
+    # Our record of the playlist's contents is now exact, so restart the clock
+    # rather than leaving a re-read due.
+    db.execute("UPDATE stations SET spotify_reconciled_at = ? WHERE id = ?",
+               (db.now(), station["id"]))
+    db.log_event(
+        f"{station['name']}: removed {removed} duplicate track(s) from the "
+        f"Spotify playlist ({len(duplicated)} track(s) were listed more than once).",
+        source="sync",
+    )
+    return {"ok": True, "removed": removed, "tracks": len(uris) - removed,
+            "distinct": len(duplicated)}
 
 
 # --- orchestration -----------------------------------------------------------

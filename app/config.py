@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Holiday Radio Matcher"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 USER_AGENT = (
     f"HolidayRadioMatcher/{APP_VERSION} "
     "( https://github.com/TronVonDoom/Holiday-Radio-Monitor )"

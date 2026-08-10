@@ -48,7 +48,7 @@ def _upsert_song(obs: sources.Observation) -> int:
     `plays`, so only `ingest` may touch `play_count` - counting here inflated it
     by roughly the number of times a play stayed inside the history window.
     """
-    fp = fingerprint(obs.artist, obs.title, obs.external_id)
+    fp = fingerprint(obs.artist, obs.title)
     album = "" if is_junk_album(obs.album) else obs.album
     now = db.now()
 

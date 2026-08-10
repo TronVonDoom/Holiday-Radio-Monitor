@@ -298,7 +298,7 @@ configuration needed to see it working.
 | **Dashboard** | Match rate, queue depth, what is on air across every station, recent plays, worker activity |
 | **Review** | The queue: search at the top, then ranked candidates with per-signal score breakdowns. Resolve, archive for later, or mark as imaging |
 | **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence — and where the archive lives |
-| **Playlists** | What is being delivered per station, with links into Spotify and JSON export |
+| **Playlists** | What is being delivered per station, with links into Spotify, JSON export, and duplicate cleanup |
 | **Stations** | Add, discover, test, pause and remove streams |
 | **Settings** | Thresholds, providers, Spotify link, and your learned rules |
 
@@ -327,6 +327,36 @@ https://open.spotify.com/track/...
 
 Identified songs with no playable link are kept as `#EXT-X-UNRESOLVED` comments
 rather than dropped, so a correct identification is never lost.
+
+### One song, one entry
+
+A song is identified by its **normalized artist and title** — case, accents,
+punctuation and leading articles removed — and by nothing else. So
+`The purple people eater` and `The Purple People Eater` are one song in the
+library, matched once, reviewed once and delivered once.
+
+Earlier versions preferred the source's own identifier when one was offered,
+which sounds authoritative and was the opposite of helpful: AzuraCast hashes the
+raw metadata text, so every spelling of a song became a separate identity — and
+the normalization built to see through exactly that was skipped whenever an
+identifier existed. Stations reached over plain Icecast supply no identifier at
+all, and two AzuraCast servers share no identifier namespace, so the same song
+could be several rows for several unrelated reasons.
+
+**Existing databases repair themselves on first start.** Duplicate rows are
+merged into the furthest-along copy: plays keep their history, playlist
+membership keeps the earliest join date, and a track already delivered to
+Spotify stays marked as delivered so it is never sent twice.
+
+Delivery is deduplicated by *recording* rather than by row, too. Two songs that
+resolve to the same track — different spellings on different days — put one
+entry in the playlist, not two.
+
+If a playlist already collected duplicates under the old behaviour, **Playlists
+→ Remove duplicates** cleans it. Spotify's removal endpoint clears every copy of
+a track at once, so each duplicated track is removed and re-added once, which
+moves it to the end of the playlist; tracks appearing only once are never
+touched. It runs when you ask rather than during a sync, for that reason.
 
 ---
 

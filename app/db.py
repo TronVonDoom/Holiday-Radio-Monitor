@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
+from .normalize import fingerprint
 
 _local = threading.local()
 _write_lock = threading.Lock()
@@ -283,6 +284,147 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "INSERT INTO settings(key, value) VALUES('migrated_rejected_to_archived', '1') "
             "ON CONFLICT(key) DO UPDATE SET value = '1'"
         )
+
+    # Song identity used to come from the source's own id when one was offered,
+    # which meant the same recording got a separate row per station (see
+    # `normalize.fingerprint`). Every one of those rows was matched separately,
+    # reviewed separately and delivered to the playlist separately. Rebuild the
+    # fingerprints on the new rule and fold the collisions together.
+    if "migrated_fingerprint_dedupe" not in done:
+        merged = _merge_duplicate_songs(conn)
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('migrated_fingerprint_dedupe', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
+        if merged:
+            conn.execute(
+                "INSERT INTO events(level, source, message, created_at) VALUES(?,?,?,?)",
+                ("info", "setup",
+                 f"Merged {merged} duplicate song row(s) that the old per-station "
+                 "identity had split apart. Play counts and playlist membership "
+                 "were preserved.", now()),
+            )
+
+
+# How much a status is worth when two rows for the same song have to become one.
+# A verdict the user gave by hand outranks anything the engine decided, and a
+# resolved row outranks an unresolved one, because the merged row should be the
+# furthest along rather than merely the oldest.
+_STATUS_RANK = {
+    "confirmed": 6, "matched": 5, "review": 4, "pending": 3,
+    "unmatched": 2, "archived": 1, "nonsong": 0,
+}
+
+# Blank fields on the survivor that a duplicate may be able to fill in. Only
+# ever used to fill a hole - never to overwrite - so the survivor's own
+# identification is always the one that stands.
+_FILLABLE = (
+    "raw_album", "duration", "art_url", "match_artist", "match_title",
+    "match_album", "match_duration", "mbid", "isrc", "spotify_id",
+    "spotify_uri", "spotify_url", "match_art_url", "match_method",
+)
+
+
+def _merge_duplicate_songs(conn: sqlite3.Connection) -> int:
+    """Fold rows that are the same song into one. Returns how many were removed.
+
+    Called with `_write_lock` held, so it must use `conn` directly.
+
+    Everything that pointed at a removed row is moved onto the survivor first:
+    plays keep their history (a play already recorded against the survivor at
+    the same second is dropped as the duplicate observation it is), and playlist
+    membership keeps the earliest join date and the *union* of the delivery
+    flags - a track already pushed to Spotify under one row must not look
+    undelivered just because it survived as the other, or sync would send it a
+    second time and put it in the playlist twice.
+    """
+    rows = conn.execute("SELECT * FROM songs").fetchall()
+
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        groups.setdefault(fingerprint(row["raw_artist"], row["raw_title"]), []).append(row)
+
+    # Park every fingerprint somewhere it cannot collide before writing the new
+    # ones. `fingerprint` is UNIQUE, and a row being given its canonical value
+    # can otherwise collide with a *different* row that still holds that value
+    # as its old one - which aborts the whole migration on a constraint the end
+    # state does not actually violate.
+    conn.execute("UPDATE songs SET fingerprint = 'tmp:' || id")
+
+    def rank(row: sqlite3.Row) -> tuple[int, int, float, int]:
+        return (
+            _STATUS_RANK.get(row["status"], 0),
+            1 if (row["spotify_uri"] or "") else 0,
+            float(row["confidence"] or 0.0),
+            -int(row["id"]),          # oldest wins a tie
+        )
+
+    removed = 0
+    for fp, members in groups.items():
+        if len(members) > 1:
+            members = sorted(members, key=rank, reverse=True)
+            keeper, losers = members[0], members[1:]
+            keeper_id = int(keeper["id"])
+            loser_ids = [int(m["id"]) for m in losers]
+
+            for column in _FILLABLE:
+                if keeper[column] in (None, "", 0):
+                    filled = next((m[column] for m in losers
+                                   if m[column] not in (None, "", 0)), None)
+                    if filled is not None:
+                        conn.execute(f"UPDATE songs SET {column} = ? WHERE id = ?",
+                                     (filled, keeper_id))
+
+            conn.execute(
+                "UPDATE songs SET first_seen_at = ?, last_seen_at = ? WHERE id = ?",
+                (min(int(m["first_seen_at"]) for m in members),
+                 max(int(m["last_seen_at"]) for m in members), keeper_id),
+            )
+
+            for loser_id in loser_ids:
+                # OR IGNORE keeps a play the survivor already has; the leftovers
+                # are removed by the foreign key cascade when the row goes.
+                conn.execute("UPDATE OR IGNORE plays SET song_id = ? WHERE song_id = ?",
+                             (keeper_id, loser_id))
+
+                for entry in conn.execute(
+                    "SELECT * FROM playlist_entries WHERE song_id = ?", (loser_id,)
+                ).fetchall():
+                    existing = conn.execute(
+                        "SELECT * FROM playlist_entries WHERE station_id = ? AND song_id = ?",
+                        (entry["station_id"], keeper_id),
+                    ).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            "UPDATE playlist_entries SET song_id = ? WHERE id = ?",
+                            (keeper_id, entry["id"]),
+                        )
+                        continue
+                    conn.execute(
+                        "UPDATE playlist_entries SET added_at = ?, spotify_synced = ?, "
+                        "m3u_synced = ? WHERE id = ?",
+                        (min(int(existing["added_at"]), int(entry["added_at"])),
+                         max(int(existing["spotify_synced"]), int(entry["spotify_synced"])),
+                         max(int(existing["m3u_synced"]), int(entry["m3u_synced"])),
+                         existing["id"]),
+                    )
+
+                # Cascades to this row's remaining plays, entries and candidates.
+                conn.execute("DELETE FROM songs WHERE id = ?", (loser_id,))
+                removed += 1
+        else:
+            keeper_id = int(members[0]["id"])
+
+        conn.execute("UPDATE songs SET fingerprint = ? WHERE id = ?", (fp, keeper_id))
+
+    if removed:
+        # play_count is a cache of COUNT(*) over `plays`, and merging changed
+        # both sides of that, so it is rebuilt rather than added up.
+        conn.execute(
+            "UPDATE songs SET play_count = "
+            "(SELECT COUNT(*) FROM plays WHERE plays.song_id = songs.id)"
+        )
+    return removed
 
 
 def query(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:

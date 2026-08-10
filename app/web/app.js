@@ -622,6 +622,8 @@ async function renderPlaylists() {
             ${p.spotify_playlist_id ? `<a class="btn ghost sm" target="_blank" rel="noopener"
               href="https://open.spotify.com/playlist/${esc(p.spotify_playlist_id)}">Open in Spotify</a>` : ""}
             <a class="btn ghost sm" href="/api/export/${p.id}.json" target="_blank">Export JSON</a>
+            ${p.spotify_playlist_id ? `<button class="btn ghost sm" data-dedupe="${p.id}"
+              title="Remove tracks listed more than once. Deduplicated tracks move to the end of the playlist.">Remove duplicates</button>` : ""}
             <button class="btn sm" data-sync="${p.id}">Sync now</button>
           </div>
         </div>
@@ -902,7 +904,7 @@ async function refresh() {
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-archive],[data-unarchive]," +
     "[data-nonsong],[data-rematch],[data-resume]," +
-    "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
+    "[data-sync],[data-dedupe],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
     "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-more,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
     "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
   if (!t) return;
@@ -1031,6 +1033,22 @@ document.addEventListener("click", async (ev) => {
       toast(r.spotify && !r.spotify.ok ? r.spotify.reason
         : `Synced — ${r.spotify?.added ?? 0} added to Spotify, ${r.m3u?.entries ?? 0} in the M3U`,
         r.spotify && !r.spotify.ok ? "bad" : "ok");
+    } catch (e) { toast(e.message, "bad"); }
+    return renderPlaylists();
+  }
+
+  if (d.dedupe) {
+    // Says what it will do before it does it: the tracks it cleans up lose
+    // their place in the playlist, and that is not something to discover after.
+    if (!confirm("Remove tracks that appear more than once in this Spotify playlist?\n\n"
+      + "Each duplicated track is removed and added back once, so those tracks move "
+      + "to the end of the playlist. Tracks that appear only once are left alone.")) return;
+    t.disabled = true; t.textContent = "Cleaning…";
+    try {
+      const res = await api(`/playlists/${d.dedupe}/dedupe`, { method: "POST" });
+      toast(res.ok
+        ? (res.removed ? `Removed ${res.removed} duplicate track(s)` : "No duplicates found")
+        : res.reason, res.ok ? "ok" : "bad");
     } catch (e) { toast(e.message, "bad"); }
     return renderPlaylists();
   }

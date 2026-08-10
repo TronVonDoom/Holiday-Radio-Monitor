@@ -569,15 +569,19 @@ async def ensure_playlist(playlist_id: str, name: str, description: str) -> str:
     return await create_playlist(name, description)
 
 
-async def playlist_track_uris(playlist_id: str) -> set[str]:
-    """Every track URI already in the playlist.
+async def playlist_track_uri_list(playlist_id: str) -> list[str]:
+    """Every track URI in the playlist, in playlist order, duplicates included.
 
     Reads /playlists/{id}/items - the February 2026 replacement for
     /playlists/{id}/tracks - where each entry carries the track under `item`.
     `track` is still populated but documented as deprecated, so it is only a
     fallback here.
+
+    Order and repeats are preserved because the duplicate cleanup needs to see
+    that a URI appears twice; the sync path only needs membership and collapses
+    this to a set.
     """
-    uris: set[str] = set()
+    uris: list[str] = []
     url = f"/playlists/{playlist_id}/items"
     # limit is capped at 50 on the items endpoint, down from 100 on /tracks.
     params: dict | None = {"fields": "items(item(uri),track(uri)),next", "limit": 50}
@@ -586,10 +590,15 @@ async def playlist_track_uris(playlist_id: str) -> set[str]:
         for entry in data.get("items") or []:
             track = entry.get("item") or entry.get("track") or {}
             if track.get("uri"):
-                uris.add(track["uri"])
+                uris.append(track["uri"])
         url = data.get("next") or ""
         params = None  # `next` already carries the query string.
     return uris
+
+
+async def playlist_track_uris(playlist_id: str) -> set[str]:
+    """Every track URI already in the playlist."""
+    return set(await playlist_track_uri_list(playlist_id))
 
 
 async def add_tracks(playlist_id: str, uris: list[str]) -> int:
