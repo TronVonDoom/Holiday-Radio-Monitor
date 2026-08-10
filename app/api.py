@@ -17,7 +17,11 @@ from .providers import musicbrainz, spotify
 
 router = APIRouter(prefix="/api")
 
-STATUSES = ("pending", "matched", "review", "unmatched", "confirmed", "rejected", "nonsong")
+STATUSES = ("pending", "matched", "review", "unmatched", "confirmed", "archived", "nonsong")
+
+# Statuses the review queue works through, and therefore the ones a song can be
+# restored to when it comes back out of the archive.
+QUEUE_STATUSES = ("pending", "review", "unmatched")
 
 
 # --- models ------------------------------------------------------------------
@@ -402,16 +406,43 @@ async def confirm_song(song_id: int, payload: ConfirmIn) -> dict[str, Any]:
     return get_song(song_id)
 
 
-@router.post("/songs/{song_id}/reject")
-def reject_song(song_id: int, remember: bool = Query(default=False)) -> dict[str, Any]:
+@router.post("/songs/{song_id}/archive")
+def archive_song(song_id: int) -> dict[str, Any]:
+    """Park a song out of the review queue without deciding anything about it.
+
+    Deliberately not a verdict: no alias is written, candidates and confidence are
+    left alone, and the previous status is recorded so restoring returns the item
+    exactly as it was left. Re-airings keep updating the row but never revive it,
+    because ingestion only ever touches `last_seen_at`.
+    """
     song = _song_or_404(song_id)
+    if song["status"] == "archived":
+        return song
     db.execute(
-        "UPDATE songs SET status = 'rejected', resolved_at = ?, confidence = 0 WHERE id = ?",
-        (db.now(), song_id),
+        "UPDATE songs SET status = 'archived', archived_from = ? WHERE id = ?",
+        (song["status"], song_id),
     )
-    db.execute("DELETE FROM playlist_entries WHERE song_id = ?", (song_id,))
-    if remember:
-        _write_alias(song, {}, kind="nonsong")
+    return _song_or_404(song_id)
+
+
+@router.post("/songs/{song_id}/unarchive")
+def unarchive_song(song_id: int) -> dict[str, Any]:
+    song = _song_or_404(song_id)
+    if song["status"] != "archived":
+        raise HTTPException(409, "That song is not archived.")
+
+    previous = song["archived_from"]
+    if previous not in QUEUE_STATUSES:
+        # Archived before the column existed, or from a status the queue no longer
+        # shows. Put it wherever the review UI can act on it: with candidates it
+        # belongs in review, without them it is an unmatched item to search by hand.
+        has_candidates = db.query_one(
+            "SELECT 1 AS n FROM candidates WHERE song_id = ? LIMIT 1", (song_id,)
+        )
+        previous = "review" if has_candidates else "unmatched"
+
+    db.execute("UPDATE songs SET status = ?, archived_from = NULL WHERE id = ?",
+               (previous, song_id))
     return _song_or_404(song_id)
 
 

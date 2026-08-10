@@ -204,8 +204,11 @@ configuration needed to see it working.
    </details>
 
 3. **Work the review queue** — the badge in the sidebar shows how many songs are
-   waiting. Each shows the stream metadata, ranked candidates, and *why* each
-   scored the way it did. Confirming teaches the matcher permanently.
+   waiting. Each shows the stream metadata, a prefilled search box, ranked
+   candidates, and *why* each scored the way it did. Confirming teaches the
+   matcher permanently. Anything you would rather not decide on yet can be
+   **archived**: it leaves the queue without a verdict and waits in the Library
+   under *archived*, where **Restore** puts it back exactly as you left it.
 
 ---
 
@@ -214,8 +217,8 @@ configuration needed to see it working.
 | View | What it is for |
 |---|---|
 | **Dashboard** | Match rate, queue depth, what is on air across every station, recent plays, worker activity |
-| **Review** | The queue, with ranked candidates, per-signal score breakdowns, and manual search |
-| **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence |
+| **Review** | The queue: search at the top, then ranked candidates with per-signal score breakdowns. Resolve, archive for later, or mark as imaging |
+| **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence — and where the archive lives |
 | **Playlists** | What is being delivered per station, with links into Spotify and JSON export |
 | **Stations** | Add, discover, test, pause and remove streams |
 | **Settings** | Thresholds, providers, Spotify link, and your learned rules |

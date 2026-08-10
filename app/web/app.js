@@ -169,6 +169,7 @@ const state = {
   stats: null,
   reviewIndex: 0,
   reviewQueue: [],
+  archivedCount: 0,
   library: { status: "", q: "", sort: "recent", page: 1 },
   stationsPage: 1,
   playlistPages: {},   // station id -> page number
@@ -265,17 +266,32 @@ async function renderDashboard() {
 /* ---------- review ---------- */
 
 async function renderReview() {
-  const data = await api("/songs?status=review,unmatched&sort=plays&limit=100");
+  // The archive is only a count here; the list itself is the Library filtered to
+  // it, which already has search, sorting and paging.
+  const [data, archived] = await Promise.all([
+    api("/songs?status=review,unmatched&sort=plays&limit=100"),
+    api("/songs?status=archived&limit=1"),
+  ]);
   state.reviewQueue = data.items;
+  state.archivedCount = archived.total;
   if (state.reviewIndex >= data.items.length) state.reviewIndex = 0;
 
   if (!data.items.length) {
-    $("#view-review").innerHTML = emptyState("✅", "Review queue is clear",
-      "Everything the matcher was unsure about has been resolved.");
+    $("#view-review").innerHTML = `
+      ${emptyState("✅", "Review queue is clear",
+        "Everything the matcher was unsure about has been resolved.")}
+      ${state.archivedCount
+        ? `<div class="row" style="justify-content:center">${archiveButton()}</div>` : ""}`;
     return;
   }
   await renderReviewCard();
 }
+
+/* The way back to anything set aside. Shown wherever the queue is, so the archive
+   never becomes a place things silently disappear into. */
+const archiveButton = () => state.archivedCount
+  ? `<button class="btn ghost sm" id="rv-archived">Archived (${state.archivedCount})</button>`
+  : "";
 
 async function renderReviewCard() {
   const song = state.reviewQueue[state.reviewIndex];
@@ -313,14 +329,16 @@ async function renderReviewCard() {
         </div>
       </div>`;
   }).join("") : `<div class="muted" style="padding:.5rem 0">
-      No candidates were found. Try a manual search below, or mark it as not-a-song.</div>`;
+      No candidates were found. Correct the artist or title above and search again,
+      archive it for later, or mark it as not-a-song.</div>`;
 
   $("#view-review").innerHTML = `
     <div class="review-head">
       <div class="muted">Item ${state.reviewIndex + 1} of ${state.reviewQueue.length}</div>
       <div class="row" style="gap:.4rem">
+        ${archiveButton()}
         <button class="btn ghost sm" id="rv-prev">← Previous</button>
-        <button class="btn ghost sm" id="rv-skip">Skip →</button>
+        <button class="btn ghost sm" id="rv-next">Next →</button>
       </div>
     </div>
 
@@ -338,14 +356,9 @@ async function renderReviewCard() {
     </div>
 
     <div class="card" style="margin-bottom:1rem">
-      <h2>Suggested matches</h2>
-      <p class="sub">Ranked by artist, title and track-length agreement. Confirming also teaches the matcher, so this track resolves instantly next time.</p>
-      ${candHtml}
-    </div>
-
-    <div class="card">
-      <h2>Search manually</h2>
-      <p class="sub">Correct the artist or title and search MusicBrainz and Spotify again.</p>
+      <h2>Search</h2>
+      <p class="sub">Prefilled with what the stream said. Correct either field and search
+        MusicBrainz and Spotify again — results replace the list below.</p>
       <div class="row">
         <div class="field"><label>Artist</label>
           <input type="text" id="ms-artist" value="${esc(s.raw_artist)}"></div>
@@ -355,11 +368,22 @@ async function renderReviewCard() {
       </div>
       <div class="row" style="margin-top:.9rem; gap:.4rem">
         <button class="btn ghost sm" data-rematch="${s.id}">Run auto-match again</button>
+        <button class="btn ghost sm" data-archive="${s.id}">Archive for later</button>
         <button class="btn bad sm" data-nonsong="${s.id}">Not a song (jingle / ID)</button>
-        <button class="btn bad sm" data-reject="${s.id}">Skip permanently</button>
       </div>
+    </div>
+
+    <div class="card" id="rv-matches">
+      <h2>Suggested matches</h2>
+      <p class="sub">Ranked by artist, title and track-length agreement. Confirming also teaches the matcher, so this track resolves instantly next time.</p>
+      ${candHtml}
     </div>`;
 }
+
+/* A search rewrites the card from the top, which would leave its own results off
+   screen — so bring them back into view. */
+const showMatches = () =>
+  $("#rv-matches")?.scrollIntoView({ behavior: "smooth", block: "start" });
 
 /* ---------- library ---------- */
 
@@ -379,7 +403,7 @@ async function renderLibrary() {
     data = await api(`/songs?${params}`);
   }
 
-  const chips = ["", "matched", "confirmed", "review", "unmatched", "pending", "nonsong"]
+  const chips = ["", "matched", "confirmed", "review", "unmatched", "archived", "pending", "nonsong"]
     .map((s) => `<button class="chip ${state.library.status === s ? "on" : ""}" data-filter="${s}">
         ${s || "All"}</button>`).join("");
 
@@ -393,8 +417,16 @@ async function renderLibrary() {
       <td>${confidenceCell(r.confidence)}</td>
       <td class="num muted">${r.play_count}</td>
       <td class="num muted">${fmtTime(r.last_seen_at)}</td>
-      <td class="num">${r.spotify_url ? `<a href="${esc(r.spotify_url)}" target="_blank" rel="noopener">Spotify</a>` : ""}</td>
+      <td class="num">${r.status === "archived"
+        ? `<button class="btn ghost sm" data-unarchive="${r.id}">Restore</button>`
+        : r.spotify_url ? `<a href="${esc(r.spotify_url)}" target="_blank" rel="noopener">Spotify</a>` : ""}</td>
     </tr>`).join("");
+
+  const archiveNote = state.library.status === "archived"
+    ? `<p class="sub" style="margin:-.2rem 0 .7rem">Set aside from the review queue,
+       untouched and out of the way. <strong>Restore</strong> puts one back where you
+       left it.</p>`
+    : "";
 
   $("#view-library").innerHTML = `
     <div class="toolbar">
@@ -407,6 +439,7 @@ async function renderLibrary() {
         <option value="artist"${sort === "artist" ? " selected" : ""}>Artist A–Z</option>
       </select>
     </div>
+    ${archiveNote}
     <div class="card"><div class="table-wrap"><table>
       <thead><tr><th>Matched as</th><th>Stream metadata</th><th>Status</th>
         <th>Confidence</th><th class="num">Plays</th><th class="num">Last seen</th><th class="num"></th></tr></thead>
@@ -717,9 +750,10 @@ async function refresh() {
 /* ---------- events ---------- */
 
 document.addEventListener("click", async (ev) => {
-  const t = ev.target.closest("[data-view],[data-confirm],[data-reject],[data-nonsong],[data-rematch]," +
+  const t = ev.target.closest("[data-view],[data-confirm],[data-archive],[data-unarchive]," +
+    "[data-nonsong],[data-rematch]," +
     "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
-    "#btn-refresh,#btn-sync,#rv-prev,#rv-skip,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
+    "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
     "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
   if (!t) return;
 
@@ -764,21 +798,46 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
-  if (d.nonsong || d.reject) {
-    const id = d.nonsong || d.reject;
-    const path = d.nonsong ? "nonsong" : "reject";
+  if (d.nonsong) {
     try {
-      await api(`/songs/${id}/${path}?remember=true`, { method: "POST" });
-      toast(d.nonsong ? "Marked as station imaging" : "Skipped permanently", "ok");
+      await api(`/songs/${d.nonsong}/nonsong?remember=true`, { method: "POST" });
+      toast("Marked as station imaging", "ok");
       state.reviewQueue.splice(state.reviewIndex, 1);
       await (state.reviewQueue.length ? renderReviewCard() : renderReview());
     } catch (e) { toast(e.message, "bad"); }
     return;
   }
 
+  if (d.archive) {
+    try {
+      await api(`/songs/${d.archive}/archive`, { method: "POST" });
+      state.archivedCount += 1;
+      toast("Archived — restore it any time from the Library", "ok");
+      state.reviewQueue.splice(state.reviewIndex, 1);
+      await (state.reviewQueue.length ? renderReviewCard() : renderReview());
+    } catch (e) { toast(e.message, "bad"); }
+    return;
+  }
+
+  if (d.unarchive) {
+    t.disabled = true;
+    try {
+      await api(`/songs/${d.unarchive}/unarchive`, { method: "POST" });
+      state.archivedCount = Math.max(0, state.archivedCount - 1);
+      toast("Back in the review queue", "ok");
+      return renderLibrary();
+    } catch (e) { toast(e.message, "bad"); t.disabled = false; }
+    return;
+  }
+
+  if (t.id === "rv-archived") {
+    state.library = { status: "archived", q: "", sort: "recent", page: 1 };
+    return show("library");
+  }
+
   if (d.rematch) {
     t.disabled = true; t.textContent = "Searching…";
-    try { await api(`/songs/${d.rematch}/rematch`, { method: "POST" }); await renderReviewCard(); }
+    try { await api(`/songs/${d.rematch}/rematch`, { method: "POST" }); await renderReviewCard(); showMatches(); }
     catch (e) { toast(e.message, "bad"); }
     return;
   }
@@ -791,6 +850,7 @@ document.addEventListener("click", async (ev) => {
         body: { artist: $("#ms-artist").value, title: $("#ms-title").value },
       });
       await renderReviewCard();
+      showMatches();
     } catch (e) { toast(e.message, "bad"); t.disabled = false; t.textContent = "Search"; }
     return;
   }
@@ -799,7 +859,7 @@ document.addEventListener("click", async (ev) => {
     state.reviewIndex = Math.max(0, state.reviewIndex - 1);
     return renderReviewCard();
   }
-  if (t.id === "rv-skip") {
+  if (t.id === "rv-next") {
     state.reviewIndex = (state.reviewIndex + 1) % state.reviewQueue.length;
     return renderReviewCard();
   }

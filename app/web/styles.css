@@ -188,8 +188,10 @@ tr.filler:hover { background: none; }
 }
 .badge.matched, .badge.confirmed { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
 .badge.review   { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
-.badge.unmatched, .badge.rejected { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 32%, transparent); }
+.badge.unmatched { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 32%, transparent); }
 .badge.pending  { background: color-mix(in srgb, var(--info) 14%, transparent); color: var(--info); border-color: color-mix(in srgb, var(--info) 32%, transparent); }
+/* Set aside, not judged — deliberately the only badge on the secondary accent. */
+.badge.archived { background: color-mix(in srgb, var(--accent-2) 14%, transparent); color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 34%, transparent); }
 .badge.nonsong  { background: var(--bg-elev-2); color: var(--text-faint); border-color: var(--line); }
 .badge.holiday  { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
 

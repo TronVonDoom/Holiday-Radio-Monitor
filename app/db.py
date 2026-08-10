@@ -59,8 +59,11 @@ CREATE TABLE IF NOT EXISTS songs (
     norm_title      TEXT NOT NULL DEFAULT '',
     duration        INTEGER,
     art_url         TEXT,
-    -- pending | matched | review | unmatched | confirmed | rejected | nonsong
+    -- pending | matched | review | unmatched | confirmed | archived | nonsong
     status          TEXT NOT NULL DEFAULT 'pending',
+    -- Status held before the user archived the song, so restoring puts it back
+    -- in the same place in the review queue rather than guessing.
+    archived_from   TEXT,
     confidence      REAL NOT NULL DEFAULT 0,
     match_method    TEXT,
     -- Resolved identity
@@ -208,6 +211,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("SELECT key FROM settings WHERE value = '1' AND key LIKE 'migrated_%'")
     }
 
+    # `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched, so columns
+    # added after first run have to be attached explicitly.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(songs)")}
+    if "archived_from" not in columns:
+        conn.execute("ALTER TABLE songs ADD COLUMN archived_from TEXT")
+
     # play_count used to be incremented once per *observation*. Because AzuraCast
     # serves a rolling history window, a single play was counted on every poll it
     # remained visible for, inflating the figure roughly thirtyfold. Recompute it
@@ -219,6 +228,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO settings(key, value) VALUES('migrated_play_count_from_plays', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
+
+    # 'rejected' was a permanent skip with no way back. Archiving replaced it, so
+    # anything skipped under the old rule becomes restorable instead of stranded
+    # in a status nothing in the UI can reach any more.
+    if "migrated_rejected_to_archived" not in done:
+        conn.execute("UPDATE songs SET status = 'archived' WHERE status = 'rejected'")
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('migrated_rejected_to_archived', '1') "
             "ON CONFLICT(key) DO UPDATE SET value = '1'"
         )
 
