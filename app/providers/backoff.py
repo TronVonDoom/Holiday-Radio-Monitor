@@ -66,11 +66,16 @@ class Breaker:
 
     def __init__(self, name: str, setting_key: str, default_seconds: float = 60.0,
                  steps: tuple[int, ...] = DEFAULT_STEPS,
+                 max_seconds: float = 900.0,
                  fallback_note: str = "") -> None:
         self.name = name
         self.setting_key = setting_key
         self.default_seconds = default_seconds
         self.steps = steps
+        # Ceiling on a single pause. Set at or above the top escalation step so
+        # it never touches our own backoff - it exists only to bound a service
+        # that asks for an unreasonable wait. See `open` for why.
+        self.max_seconds = max_seconds
         # Appended to the log line, e.g. "Matching continues on Spotify alone."
         self.fallback_note = fallback_note
         self._until = 0.0
@@ -96,18 +101,29 @@ class Breaker:
         """Record backpressure and refuse local calls until the cooldown expires.
 
         Returns the delay applied, for the caller's error message.
+
+        `Retry-After` leads whenever it is longer than our own floor, but it is
+        capped. A service can name a wait of many hours - Spotify does this to an
+        application that has broken its longer-window quota rather than merely
+        burst - and obeying that literally takes the provider out for the rest of
+        the day with no way to notice it has come back. Capping means one refused
+        request per cap period instead, which costs nothing and lets matching
+        resume on its own the moment the ban actually lifts.
         """
         self._streak += 1
         base = max(1.0, db.get_float(self.setting_key, self.default_seconds))
         step = base * self.steps[min(self._streak, len(self.steps)) - 1]
-        # Honour Retry-After in full when the service names a delay, but never
-        # wait less than our own escalating floor.
-        delay = max(step, retry_after or 0.0)
+        asked = max(step, retry_after or 0.0)
+        delay = min(asked, self.max_seconds)
         self._until = max(self._until, time.monotonic() + delay)
         note = f" {self.fallback_note}" if self.fallback_note else ""
+        # Say so when we are deliberately not obeying in full, so a capped wait
+        # is never mistaken for what the service actually asked for.
+        asked_note = (f" It asked for {asked:.0f}s; capped so we notice when it "
+                      f"recovers." if delay < asked else "")
         db.log_event(
             f"{self.name} asked us to back off; pausing calls for {delay:.0f}s "
-            f"(consecutive throttles: {self._streak}).{note}",
+            f"(consecutive throttles: {self._streak}).{asked_note}{note}",
             level="warn", source=self.name.lower(),
         )
         return delay
@@ -119,6 +135,24 @@ class Breaker:
                          level="info", source=self.name.lower())
         self._streak = 0
         self._until = 0.0
+
+    def resume(self) -> float:
+        """Clear the cooldown on the user's instruction. Returns seconds skipped.
+
+        The cooldown is a guess about when the service will accept us again, and
+        the user may know better - they have fixed the quota, or the ban has been
+        lifted, or they simply want to find out. Nothing here overrides the
+        service itself: the very next refusal opens a new cooldown.
+        """
+        skipped = self.remaining()
+        self._streak = 0
+        self._until = 0.0
+        if skipped > 0:
+            db.log_event(
+                f"{self.name} cooldown cleared by hand with {skipped:.0f}s left; "
+                "calls resume now.", level="info", source=self.name.lower(),
+            )
+        return skipped
 
     def reset(self) -> None:
         """Drop all state without logging. For tests."""

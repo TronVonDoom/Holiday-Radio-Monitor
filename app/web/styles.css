@@ -142,6 +142,7 @@ body::before {
 .stat .label { color: var(--text-dim); font-size: .78rem; text-transform: uppercase; letter-spacing: .1em; }
 .stat .value { font-size: 1.85rem; font-weight: 750; letter-spacing: -.03em; margin-top: .35rem; font-variant-numeric: tabular-nums; }
 .stat .foot { font-size: .8rem; color: var(--text-faint); margin-top: .15rem; }
+.stat .acts { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
 .stat .bar { height: 5px; border-radius: 3px; background: var(--line-soft); margin-top: .7rem; overflow: hidden; }
 .stat .bar > i { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
 

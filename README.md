@@ -70,16 +70,30 @@ Four things keep this app a well-behaved citizen of both:
   just under one per second no matter how many stations are monitored.
 - **A meaningful User-Agent**, with a contact URL, as MusicBrainz policy requires.
 - **Honouring backpressure.** A `503` or `429` opens a per-provider cooldown: no
-  further requests are sent until it expires, `Retry-After` is honoured in full,
-  and repeated throttling escalates the pause. A refusal also abandons the
-  remaining query spellings, because they would each be refused too. How far the
-  pause escalates depends on how much the service tells us: MusicBrainz names no
-  delay, so its cooldown steps up to 3×, 10× then 30×; Spotify does, so its own
-  figure leads and our floor only steps up to 2×, 4× then 8×.
+  further requests are sent until it expires, `Retry-After` leads whenever it is
+  longer than our own floor, and repeated throttling escalates the pause. A
+  refusal also abandons the remaining query spellings, because they would each be
+  refused too. How far the pause escalates depends on how much the service tells
+  us: MusicBrainz names no delay, so its cooldown steps up to 3×, 10× then 30×;
+  Spotify does, so its own figure leads and our floor only steps up to 2×, 4×
+  then 8×.
+- **Not being parked for a day.** A single pause is capped — 15 minutes for
+  Spotify, 30 for MusicBrainz, both at or above the top escalation step so the
+  cap never shortens our own backoff. It exists because a service can ask for far
+  longer: Spotify answers an application that has broken its *longer-window*
+  quota with a `Retry-After` measured in hours, and obeying that literally takes
+  matching and playlist delivery out for the rest of the day with no way to
+  notice it has recovered. Capping costs one refused request per cap period and
+  resumes on its own the moment the ban lifts. The Activity log says when a wait
+  was capped and what was actually asked for.
 - **Degrading instead of stalling.** One cold provider means matching continues
-  on the other; the dashboard names whichever is paused, and the Activity log
-  records it. Confidence is a little lower without two databases corroborating,
-  so expect more items in review while it lasts.
+  on the other; the dashboard names whichever is paused and offers **Resume now**
+  to clear the cooldown, and the Activity log records it. Confidence is a little
+  lower without two databases corroborating, so expect more items in review while
+  it lasts. A cooldown is only a prediction about when the service will accept us
+  again — if you know better, resuming skips the wait, and the next refusal
+  simply opens a new one. Cooldown state is in-memory by design, so restarting
+  the container also clears it.
 
 Query volume is kept low for the same reason: a confident hit on the first
 spelling ends the search, so a recognisable song costs exactly one request, and

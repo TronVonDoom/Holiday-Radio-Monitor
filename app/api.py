@@ -535,6 +535,31 @@ async def run_matcher(limit: int = Query(default=25, ge=1, le=200)) -> dict[str,
     return {"processed": await monitor.match_pending(limit)}
 
 
+# --- providers ---------------------------------------------------------------
+
+# Keyed by the name used in /api/stats, so the UI can act on what it displays.
+PROVIDERS = {"musicbrainz": musicbrainz, "spotify": spotify}
+
+
+@router.post("/providers/{name}/resume")
+def resume_provider(name: str) -> dict[str, Any]:
+    """Clear a provider's cooldown so the next call goes out immediately.
+
+    A cooldown is a prediction about when the service will accept us again, and
+    the user can know better than the prediction - they have fixed the quota, or
+    the ban has lifted, or they want to find out. Without this the only way to
+    clear one was to restart the container, because the state is deliberately
+    in-memory. Nothing here overrides the service: the next refusal opens a new
+    cooldown straight away.
+    """
+    provider = PROVIDERS.get(name.strip().lower())
+    if provider is None:
+        raise HTTPException(404, f"Unknown provider {name!r}.")
+    skipped = provider.resume()
+    return {"status": "resumed", "skipped_seconds": round(skipped, 1),
+            **provider.status()}
+
+
 # --- playlists ---------------------------------------------------------------
 
 @router.get("/playlists")

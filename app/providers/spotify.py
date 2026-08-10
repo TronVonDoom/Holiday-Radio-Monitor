@@ -37,8 +37,13 @@ API = "https://api.spotify.com/v1"
 # is short - a burst that trips the quota is usually forgiven within seconds.
 # So our own floor stays small and escalates gently; a genuinely long wait comes
 # from Spotify's own Retry-After, which is still honoured in full.
+#
+# The cap matters most here: Spotify answers a broken longer-window quota with a
+# Retry-After measured in hours, and taking that literally parks matching and
+# playlist delivery for the rest of the day.
 _breaker = Breaker(
     "Spotify", "spotify_cooldown_seconds", default_seconds=10.0, steps=GENTLE_STEPS,
+    max_seconds=900.0,
     fallback_note="Matching continues on MusicBrainz alone until then.",
 )
 
@@ -105,6 +110,11 @@ def cooldown_remaining() -> float:
 def status() -> dict[str, Any]:
     """Breaker state, so a cold provider is visible instead of looking idle."""
     return _breaker.status()
+
+
+def resume() -> float:
+    """Clear the cooldown now. Returns the seconds of waiting skipped."""
+    return _breaker.resume()
 
 
 def _get_client() -> httpx.AsyncClient:

@@ -71,8 +71,10 @@ _client: httpx.AsyncClient | None = None
 _rate_lock = asyncio.Lock()
 _last_request = 0.0
 
+# max_seconds sits at the top escalation step (60s x 30), so the cap never
+# shortens our own backoff - it only bounds a Retry-After asking for longer.
 _breaker = Breaker(
-    "MusicBrainz", "musicbrainz_cooldown_seconds",
+    "MusicBrainz", "musicbrainz_cooldown_seconds", max_seconds=1800.0,
     fallback_note="Matching continues on Spotify alone until then.",
 )
 
@@ -102,6 +104,11 @@ def cooldown_remaining() -> float:
 def status() -> dict[str, Any]:
     """Breaker state, so a cold provider is visible instead of looking idle."""
     return _breaker.status()
+
+
+def resume() -> float:
+    """Clear the cooldown now. Returns the seconds of waiting skipped."""
+    return _breaker.resume()
 
 
 async def _throttled_get(params: dict[str, Any]) -> dict[str, Any] | None:

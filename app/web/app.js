@@ -21,6 +21,17 @@ const fmtTime = (ts) => {
 const fmtDur = (s) => (!s || s < 0) ? "—"
   : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
 
+/* A cooldown can run from seconds to hours, and "62373s" is not a length anyone
+   reads as most of a day. */
+const fmtWait = (seconds) => {
+  const s = Math.ceil(seconds || 0);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+};
+
 const ICONS = {
   grid:   '<path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>',
   check:  '<path d="M20 6L9 17l-5-5"/>',
@@ -190,20 +201,24 @@ async function renderDashboard() {
   const c = stats.counts;
   const resolved = c.matched + c.confirmed;
   const rate = Math.round(stats.match_rate * 100);
-  // Either provider can be in a cooldown; name whichever is.
-  const providers = [["MusicBrainz", stats.musicbrainz], ["Spotify", stats.spotify]];
-  const cold = providers.filter(([, p]) => p && p.throttled).map(([n]) => n);
-  const coldFor = providers.filter(([, p]) => p && p.throttled)
-                           .map(([, p]) => p.cooldown_seconds || 0);
+  // Either provider can be in a cooldown; name whichever is. The key is carried
+  // alongside the label so the resume button acts on what is being displayed.
+  const providers = [["MusicBrainz", "musicbrainz"], ["Spotify", "spotify"]];
+  const cold = providers.filter(([, key]) => stats[key]?.throttled);
 
   const tiles = [
     { label: "Matched", value: resolved, foot: `${rate}% of resolved songs`, bar: rate },
     { label: "Needs review", value: c.review + c.unmatched, foot: "waiting on you" },
     // A provider cooldown is the one thing that makes a busy-looking queue stop
-    // draining, so it outranks "matching now…" here.
-    { label: "In queue", value: c.pending, foot: cold.length
-        ? `${cold.join(" & ")} paused ${Math.ceil(Math.max(...coldFor))}s`
-        : stats.worker.matching ? "matching now…" : "idle" },
+    // draining, so it outranks "matching now…" here — and it comes with the way
+    // out, because a cooldown is only a prediction about when the service will
+    // answer again and you may know better than it does.
+    { label: "In queue", value: c.pending,
+      foot: cold.length
+        ? cold.map(([n, key]) => `${n} paused ${fmtWait(stats[key].cooldown_seconds)}`).join(" · ")
+        : stats.worker.matching ? "matching now…" : "idle",
+      extra: cold.map(([n, key]) =>
+        `<button class="btn ghost sm" data-resume="${key}">Resume ${esc(n)} now</button>`).join("") },
     { label: "Playlist tracks", value: stats.playlist_entries, foot: `${stats.stations} station(s)` },
     { label: "Learned rules", value: stats.aliases, foot: "auto-match forever" },
     { label: "Filtered", value: c.nonsong, foot: "jingles & station IDs" },
@@ -212,6 +227,7 @@ async function renderDashboard() {
       <div class="label">${t.label}</div>
       <div class="value">${t.value.toLocaleString()}</div>
       <div class="foot">${esc(t.foot)}</div>
+      ${t.extra ? `<div class="acts">${t.extra}</div>` : ""}
       ${t.bar !== undefined ? `<div class="bar"><i style="width:${t.bar}%"></i></div>` : ""}
     </div>`).join("");
 
@@ -860,7 +876,7 @@ async function refresh() {
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target.closest("[data-view],[data-confirm],[data-archive],[data-unarchive]," +
-    "[data-nonsong],[data-rematch]," +
+    "[data-nonsong],[data-rematch],[data-resume]," +
     "[data-sync],[data-del-station],[data-del-alias],[data-filter],[data-add-station],[data-page]," +
     "#btn-refresh,#btn-sync,#rv-prev,#rv-next,#rv-more,#rv-archived,#ms-go,#disc-go,#st-add,#st-probe,#s-save," +
     "#sp-link,#sp-unlink,#sp-exchange,#sp-use-loopback,#sp-diagnose");
@@ -883,6 +899,17 @@ document.addEventListener("click", async (ev) => {
   }
 
   if (t.id === "btn-refresh") { await show(state.view); return toast("Refreshed"); }
+
+  if (d.resume) {
+    t.disabled = true;
+    try {
+      const res = await api(`/providers/${d.resume}/resume`, { method: "POST" });
+      toast(`Cooldown cleared — ${fmtWait(res.skipped_seconds)} of waiting skipped. `
+        + "If it is still throttled, the next refusal opens a new pause.", "ok");
+      return renderDashboard();
+    } catch (e) { toast(e.message, "bad"); t.disabled = false; }
+    return;
+  }
 
   if (t.id === "btn-sync") {
     t.disabled = true;
