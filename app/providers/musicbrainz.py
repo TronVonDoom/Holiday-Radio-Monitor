@@ -96,6 +96,15 @@ async def aclose() -> None:
     _client = None
 
 
+def is_configured() -> bool:
+    """MusicBrainz needs no credentials, so it is always available.
+
+    Present only so every provider answers the same question the same way and
+    the matcher can fan out over the registry without special cases.
+    """
+    return True
+
+
 def cooldown_remaining() -> float:
     """Seconds until MusicBrainz may be called again. 0 when it is available."""
     return _breaker.remaining()

@@ -7,13 +7,15 @@ Resolution runs in tiers, cheapest and most certain first:
                             instantly, offline, at full confidence. Radio
                             rotations repeat heavily, so this tier carries most
                             of the traffic once the queue has been worked once.
-  2. Provider search      - MusicBrainz and Spotify queried concurrently across
-                            plausible spellings of the artist and title.
+  2. Provider search      - every enabled catalogue queried concurrently across
+                            plausible spellings of the artist and title. See
+                            `app.providers` for what each one is there for.
   3. Scoring              - each candidate scored on artist, title and duration
                             agreement, with penalties for re-recordings.
-  4. Corroboration        - when both providers independently land on the same
-                            recording, confidence is raised; when they disagree
-                            near the threshold, an ISRC cross-check breaks the tie.
+  4. Corroboration        - when independent databases land on the same
+                            recording, confidence is raised by how many of them
+                            did; when they disagree near the threshold, an ISRC
+                            cross-check breaks the tie.
 
 The output is a confidence in [0, 1] which the caller maps onto:
     >= auto_accept   -> matched, queued for the playlist
@@ -29,7 +31,7 @@ from typing import Any
 
 from rapidfuzz import fuzz
 
-from . import db
+from . import db, providers
 from .normalize import (
     artist_tokens,
     artist_variants,
@@ -58,7 +60,37 @@ BOOTLEG_PENALTY = 0.20
 LIVE_MARKERS = ("live at", "live in", "live from", "(live", "[live", " - live",
                 "live version", "in concert", "unplugged", "bbc session")
 
-CORROBORATION_BONUS = 0.07
+# A candidate whose performer has nothing in common with the one the stream
+# named is a different recording, however well the title reads.
+#
+# This became load-bearing when the free-text catalogues were added. MusicBrainz,
+# Spotify and Deezer are asked fielded queries, so a result is the service
+# asserting that *this artist* recorded *this title*. Apple Music has no fielded
+# syntax: it answers keyword relevance and never says "nothing here", so it
+# always hands back its closest guess. Every title metric here deliberately
+# tolerates a missing subtitle - that is what rescues stream metadata - and the
+# same tolerance rates a title *fragment* highly, so "A Song That Does Not Exist
+# At All" scored 0.85 against an unrelated track called "Exist at All". With a
+# coincidental track length that was enough to float pure noise to the top of
+# the review list.
+#
+# The artist is the only signal that separates those two cases, so it gets a
+# floor. This cannot touch anything already being auto-accepted: with artist
+# agreement below the threshold the score cannot exceed
+# W_TITLE + 0.25*W_ARTIST + W_DURATION = 0.715, well under any usable
+# auto-accept setting, so the only songs it moves are ones already destined for
+# a human.
+ARTIST_MISMATCH_THRESHOLD = 0.25
+ARTIST_MISMATCH_PENALTY = 0.30
+
+# Independent databases landing on the same recording is the strongest evidence
+# the engine has short of an exact identifier, and it gets stronger the more of
+# them agree - but not proportionally. The streaming catalogues ingest from
+# overlapping distributors, so Spotify, Deezer and Apple agreeing with each
+# other is not four independent opinions; the honest shape is a solid step for
+# the second database and diminishing credit after that.
+CORROBORATION_BONUS = {2: 0.07, 3: 0.10}
+MAX_CORROBORATION_BONUS = 0.12
 ISRC_BONUS = 0.12
 
 # How many ranked candidates a resolve hands back for the review UI. The UI shows
@@ -174,6 +206,12 @@ def score_candidate(raw_artist: str, raw_title: str, duration: int | None,
         "penalties": [],
     }
 
+    # Only meaningful when the stream actually named somebody: with no artist to
+    # compare against, a low score says nothing about the candidate.
+    if norm_key(raw_artist) and artist_s < ARTIST_MISMATCH_THRESHOLD:
+        score -= ARTIST_MISMATCH_PENALTY
+        detail["penalties"].append("different performer")
+
     # A tribute/karaoke cut only counts as an impostor if the *stream* was not
     # itself asking for one.
     stream_is_impostor = has_impostor_marker(raw_title, raw_artist)
@@ -215,13 +253,11 @@ def _same_recording(a: dict[str, Any], b: dict[str, Any]) -> bool:
     )
 
 
-def _best_per_source(scored: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    best: dict[str, dict[str, Any]] = {}
-    for cand in scored:
-        src = cand.get("source", "")
-        if src not in best or cand["score"] > best[src]["score"]:
-            best[src] = cand
-    return best
+def _corroboration_bonus(sources: int) -> float:
+    """Confidence credit for a recording found in `sources` databases at once."""
+    if sources < 2:
+        return 0.0
+    return CORROBORATION_BONUS.get(sources, MAX_CORROBORATION_BONUS)
 
 
 # Two recordings of the same length to within this are the same cut, not a
@@ -296,14 +332,16 @@ def merge_candidates(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # Union both sides: either may already be the result of an earlier
             # merge, and only the union knows how many databases have weighed in.
             detail["sources"] = sorted(_sources_of(existing) | _sources_of(cand))
-            already = any((c.get("score_detail") or {}).get("corroborated")
-                          for c in (existing, cand))
-            if len(detail["sources"]) > 1 and not already:
-                # Two independent databases agreeing is much stronger evidence
-                # than either one scoring well alone. Credited once per row, no
-                # matter how many times it is merged.
-                combined["score"] = min(1.0, combined.get("score", 0.0)
-                                        + CORROBORATION_BONUS)
+            # The credit is a property of how many databases back the row, so it
+            # is recomputed from the base score rather than added again: a third
+            # database agreeing must lift the row from the two-source figure,
+            # not stack a second full bonus on top of it. `_absorb` carries
+            # `existing`'s score into `combined`, so `existing`'s recorded bonus
+            # is exactly what is already baked in there.
+            prior = float((existing.get("score_detail") or {}).get("corroboration_bonus") or 0.0)
+            bonus = _corroboration_bonus(len(detail["sources"]))
+            combined["score"] = min(1.0, combined.get("score", 0.0) - prior + bonus)
+            detail["corroboration_bonus"] = bonus
             detail["corroborated"] = len(detail["sources"]) > 1
             # An ISRC match is a property of the recording, not of the row that
             # happened to win the merge, so it survives either way round.
@@ -322,6 +360,67 @@ def merge_candidates(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged.sort(key=lambda c: (c.get("score", 0.0), bool(c.get("uri")),
                                c.get("native_score") or 0), reverse=True)
     return merged
+
+
+def _english_list(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _no_results_reason(answered: list[str], failed: list[str],
+                       errors: list[str]) -> str:
+    """Why a search came back empty, in terms the review queue can act on.
+
+    "Unmatched" covers two situations that call for opposite responses. If the
+    databases answered and none of them held the recording, then either the
+    metadata is too mangled to search on or the song was never released
+    commercially - and archiving it is a defensible decision. If they never
+    answered, nothing has been learned about the song at all and archiving it
+    throws away a song that would have matched fine an hour later.
+
+    Naming which of the two happened, and with how many catalogues behind it, is
+    the entire point of this string.
+    """
+    parts: list[str] = []
+    if answered:
+        parts.append(f"Searched {_english_list(answered)}: no recording found "
+                     "under this artist and title.")
+    if failed:
+        parts.append(f"{_english_list(failed)} could not be reached.")
+    if not parts:
+        parts.append("No results from any provider.")
+    if errors:
+        parts.append("(" + "; ".join(errors) + ")")
+    return " ".join(parts)
+
+
+async def _tiebreak_isrc(scored: list[dict[str, Any]]) -> str:
+    """A recording code for the strongest candidate that can supply one.
+
+    Deezer returns the ISRC in its search response, so most of the time this
+    costs nothing at all. Only when no candidate carries one is MusicBrainz
+    asked directly - a second request, and therefore a last resort rather than
+    the opening move.
+
+    Spotify candidates are deliberately excluded even though they can carry an
+    ISRC, because the caller spends it on `spotify.search_isrc`. A Spotify track
+    found by its own recording code is the same track a second time, and paying
+    the corroboration of an exact cross-database hit for a round trip that
+    learned nothing is how confidence gets inflated for free.
+    """
+    ranked = [c for c in sorted(scored, key=lambda c: c.get("score", 0.0), reverse=True)
+              if c.get("source") != "spotify"]
+    for cand in ranked:
+        isrc = (cand.get("isrc") or "").strip().upper()
+        if isrc:
+            return isrc
+    for cand in ranked:
+        if cand.get("source") == "musicbrainz" and cand.get("ext_id"):
+            return await musicbrainz.fetch_isrc(cand["ext_id"])
+    return ""
 
 
 async def resolve(raw_artist: str, raw_title: str, raw_album: str,
@@ -370,33 +469,43 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
     if reason:
         return MatchResult(status="nonsong", method="filter", reason=reason)
 
-    # --- Tier 2: provider search (concurrent)
-    tasks = []
-    if db.get_bool("use_musicbrainz", True):
-        tasks.append(("musicbrainz", musicbrainz.search(raw_artist, raw_title)))
-    if db.get_bool("use_spotify", True) and spotify.is_configured():
-        tasks.append(("spotify", spotify.search(raw_artist, raw_title)))
-
-    if not tasks:
+    # --- Tier 2: provider search. Every enabled catalogue at once - they share
+    # no resource, so the wait is the slowest one rather than the sum.
+    active = providers.enabled()
+    if not active:
         return MatchResult(status="unmatched", method="none",
                            reason="No match providers are enabled or configured.")
 
-    gathered = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
+    gathered = await asyncio.gather(
+        *(p.module.search(raw_artist, raw_title) for p in active),
+        return_exceptions=True,
+    )
 
     raw_candidates: list[dict[str, Any]] = []
+    answered: list[str] = []
+    failed: list[str] = []
     errors: list[str] = []
-    for (name, _), result in zip(tasks, gathered):
+    for provider, result in zip(active, gathered):
         if isinstance(result, BaseException):
-            errors.append(f"{name}: {result}")
+            failed.append(provider.label)
+            errors.append(f"{provider.label}: {result}")
             continue
+        answered.append(provider.label)
         raw_candidates.extend(result)
 
     if not raw_candidates:
-        # If every provider we tried errored, this is an outage, not a verdict.
-        all_failed = bool(errors) and len(errors) == len(tasks)
-        note = "; ".join(errors) if errors else "No results from any provider."
-        return MatchResult(status="unmatched", method="search", reason=note,
-                           retryable=all_failed)
+        # A provider that answered "nothing" and a provider that never answered
+        # are opposite outcomes, and only the first is evidence about the song.
+        # Saying which is which is the difference between a queue item you can
+        # archive with confidence and one you are guessing about, so the verdict
+        # names both sides rather than dumping a list of exceptions.
+        return MatchResult(
+            status="unmatched", method="search",
+            reason=_no_results_reason(answered, failed, errors),
+            # Every provider we could ask was unreachable: an outage, not a
+            # verdict, so the song stays queued instead of being written off.
+            retryable=bool(failed) and not answered,
+        )
 
     # --- Tier 3: scoring
     scored: list[dict[str, Any]] = []
@@ -407,25 +516,20 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
         enriched["score_detail"] = detail
         scored.append(enriched)
 
-    # --- Tier 4: corroboration. Merging folds the same recording found in both
-    # databases into one row and credits the agreement, so `best` is already the
-    # corroborated answer where there is one.
-    # `_best_per_source` runs on the pre-merge list because the ISRC tie-break
-    # below needs the MusicBrainz row's own MBID, which a merge may have folded
-    # into a Spotify-sourced row.
-    per_source = _best_per_source(scored)
-    mb_best = per_source.get("musicbrainz")
-
+    # --- Tier 4: corroboration. Merging folds the same recording found in
+    # several databases into one row and credits the agreement, so `best` is
+    # already the corroborated answer where there is one.
     unique = merge_candidates(scored)
     best = unique[0]
     method = ("corroborated" if best.get("score_detail", {}).get("corroborated")
               else f"search:{best['source']}")
 
     # ISRC tie-break: only spend the extra requests when the answer is genuinely
-    # in doubt, and only when we can act on the result.
-    if (review_floor <= best["score"] < auto_accept and mb_best
-            and mb_best.get("ext_id") and spotify.is_configured()):
-        isrc = mb_best.get("isrc") or await musicbrainz.fetch_isrc(mb_best["ext_id"])
+    # in doubt, and only when we can act on the result. Runs on the pre-merge
+    # list because it needs each provider's own identifiers, which a merge may
+    # have folded into a row belonging to a different source.
+    if review_floor <= best["score"] < auto_accept and spotify.is_configured():
+        isrc = await _tiebreak_isrc(scored)
         if isrc:
             verified: list[dict[str, Any]] = []
             for track in await spotify.search_isrc(isrc):
@@ -470,8 +574,11 @@ async def enrich_with_spotify(candidate: dict[str, Any], raw_artist: str,
                               raw_title: str, duration: int | None) -> dict[str, Any]:
     """Attach a Spotify track to a non-Spotify match so it can reach a playlist.
 
-    A MusicBrainz-only match is a correct identification but not a playable one;
-    Spotify playlists need a URI.
+    A match identified by MusicBrainz, Deezer or Apple Music is a correct
+    identification but not a playable one; Spotify playlists need a URI. When
+    the candidate carries an ISRC - which Deezer supplies for free - the lookup
+    is exact, so a song Spotify's own text search could not find still lands in
+    the playlist.
     """
     if candidate.get("source") == "spotify" or candidate.get("uri"):
         return candidate

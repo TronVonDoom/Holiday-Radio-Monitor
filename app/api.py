@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, matcher, monitor, playlists, sources
+from . import config, db, matcher, monitor, playlists, providers, sources
 from .normalize import norm_key, titlecase_display
 from .providers import musicbrainz, spotify
 
@@ -162,6 +162,11 @@ def stats() -> dict[str, Any]:
         },
         "playlist_dir": playlists.playlist_dir_status(),
         "musicbrainz": musicbrainz.status(),
+        # Every catalogue in one list, so the dashboard can name whichever is
+        # paused without keeping its own copy of the roster. `spotify` and
+        # `musicbrainz` above stay for the panels that need more than breaker
+        # state, but nothing should be enumerating providers by hand any more.
+        "providers": providers.statuses(),
         "version": config.APP_VERSION,
     }
 
@@ -481,11 +486,11 @@ async def rematch_song(song_id: int) -> dict[str, Any]:
 async def manual_search(song_id: int, payload: SearchIn) -> dict[str, Any]:
     """Free-text search used by the review UI when the automatic candidates miss.
 
-    Searches MusicBrainz and Spotify *at the same time*, in their interactive
+    Searches every enabled catalogue *at the same time*, in their interactive
     mode. Running them one after the other made every manual search cost the sum
-    of both providers - dominated by MusicBrainz, whose one-request-per-second
-    budget is charged before a request is even sent - when the two share no
-    resource and the wait is the maximum of the two, not the total.
+    of all providers - dominated by MusicBrainz, whose one-request-per-second
+    budget is charged before a request is even sent - when they share no
+    resource and the wait is the slowest of them, not the total.
 
     The response carries a per-provider report so a missing provider reads as
     "Spotify is paused for 8s" rather than as a search that quietly found less.
@@ -494,27 +499,24 @@ async def manual_search(song_id: int, payload: SearchIn) -> dict[str, Any]:
     artist = payload.artist or song["raw_artist"]
     title = payload.title or song["raw_title"]
 
-    tasks: list[tuple[str, Any]] = []
-    if db.get_bool("use_musicbrainz", True):
-        tasks.append(("MusicBrainz",
-                      musicbrainz.search(artist, title, payload.limit, interactive=True)))
-    if db.get_bool("use_spotify", True) and spotify.is_configured():
-        tasks.append(("Spotify",
-                      spotify.search(artist, title, payload.limit, interactive=True)))
-
-    gathered = await asyncio.gather(*(t[1] for t in tasks), return_exceptions=True)
+    active = providers.enabled()
+    gathered = await asyncio.gather(
+        *(p.module.search(artist, title, payload.limit, interactive=True) for p in active),
+        return_exceptions=True,
+    )
 
     results: list[dict[str, Any]] = []
-    providers: list[dict[str, Any]] = []
-    for (name, _), outcome in zip(tasks, gathered):
+    report: list[dict[str, Any]] = []
+    for provider, outcome in zip(active, gathered):
         if isinstance(outcome, BaseException):
-            db.log_event(f"Manual {name} search failed: {outcome}",
+            db.log_event(f"Manual {provider.label} search failed: {outcome}",
                          level="warn", source="review")
-            providers.append({"name": name, "ok": False, "count": 0,
-                              "detail": str(outcome)[:200]})
+            report.append({"name": provider.label, "ok": False, "count": 0,
+                           "detail": str(outcome)[:200]})
             continue
         results.extend(outcome)
-        providers.append({"name": name, "ok": True, "count": len(outcome), "detail": ""})
+        report.append({"name": provider.label, "ok": True,
+                       "count": len(outcome), "detail": ""})
 
     scored = []
     for cand in results:
@@ -527,7 +529,7 @@ async def manual_search(song_id: int, payload: SearchIn) -> dict[str, Any]:
     merged = matcher.merge_candidates(scored)
 
     monitor._store_candidates(song_id, merged[:CANDIDATES_STORED])
-    return {**get_song(song_id), "providers": providers}
+    return {**get_song(song_id), "providers": report}
 
 
 @router.post("/match/run")
@@ -536,10 +538,6 @@ async def run_matcher(limit: int = Query(default=25, ge=1, le=200)) -> dict[str,
 
 
 # --- providers ---------------------------------------------------------------
-
-# Keyed by the name used in /api/stats, so the UI can act on what it displays.
-PROVIDERS = {"musicbrainz": musicbrainz, "spotify": spotify}
-
 
 @router.post("/providers/{name}/resume")
 def resume_provider(name: str) -> dict[str, Any]:
@@ -552,12 +550,12 @@ def resume_provider(name: str) -> dict[str, Any]:
     in-memory. Nothing here overrides the service: the next refusal opens a new
     cooldown straight away.
     """
-    provider = PROVIDERS.get(name.strip().lower())
+    provider = providers.by_key(name)
     if provider is None:
         raise HTTPException(404, f"Unknown provider {name!r}.")
-    skipped = provider.resume()
+    skipped = provider.module.resume()
     return {"status": "resumed", "skipped_seconds": round(skipped, 1),
-            **provider.status()}
+            **provider.module.status()}
 
 
 # --- playlists ---------------------------------------------------------------

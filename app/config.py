@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Holiday Radio Matcher"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 USER_AGENT = (
     f"HolidayRadioMatcher/{APP_VERSION} "
     "( https://github.com/TronVonDoom/Holiday-Radio-Monitor )"
@@ -61,8 +61,15 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Tracks shorter than this are treated as jingles/station IDs, never songs.
     "min_song_seconds": "45",
     # --- Providers -----------------------------------------------------------
+    # All four are on by default. MusicBrainz and Spotify identify; Deezer and
+    # Apple Music exist to answer the question the first two cannot, which is
+    # whether a song the review queue calls "unmatched" is genuinely absent from
+    # the record or merely absent from those two catalogues. Neither needs
+    # credentials, so switching them off only costs coverage.
     "use_musicbrainz": "1",
     "use_spotify": "1",
+    "use_deezer": "1",
+    "use_itunes": "1",
     "spotify_client_id": "",
     "spotify_client_secret": "",
     "spotify_market": "US",
@@ -79,4 +86,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # to prevent a tight retry loop, and escalates to 2x, 4x and 8x.
     "musicbrainz_cooldown_seconds": "60",
     "spotify_cooldown_seconds": "10",
+    # Deezer's quota window is five seconds wide, so a refusal clears almost at
+    # once and a long floor would be dead time. Apple names no wait at all and
+    # allows roughly 20 requests a minute, so its requests are spaced like
+    # MusicBrainz's and its cooldown guesses long, which is the safe direction
+    # when a service has told you nothing.
+    "deezer_cooldown_seconds": "30",
+    "itunes_cooldown_seconds": "60",
+    "itunes_rate_limit_seconds": "3.0",
 }

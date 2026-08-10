@@ -9,8 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import api, config, db, monitor, sources
-from .providers import musicbrainz, spotify
+from . import api, config, db, monitor, providers, sources
 
 # Seeded on first run so the app is useful the moment the container starts.
 # Every other station on the network is one click away via Stations -> Discover.
@@ -48,8 +47,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await monitor.stop()
         await sources.aclose()
-        await musicbrainz.aclose()
-        await spotify.aclose()
+        # Every provider holds its own connection pool; closing them off the
+        # registry means a new catalogue is shut down properly the day it is
+        # added rather than leaking sockets until somebody notices.
+        for provider in providers.REGISTRY:
+            await provider.module.aclose()
 
 
 app = FastAPI(

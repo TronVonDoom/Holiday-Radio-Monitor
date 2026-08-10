@@ -28,8 +28,9 @@ stream metadata ──▶ normalize ──▶ match ──▶ score ──▶ �
   automatically, so a 45-second poll never misses a track.
 * **Filters station imaging** — jingles, IDs and promos are detected and never
   reach a playlist.
-* **Matches against MusicBrainz and Spotify**, scoring artist, title and track
-  length, then cross-checking the two databases against each other.
+* **Matches against four catalogues** — MusicBrainz, Spotify, Deezer and Apple
+  Music — scoring artist, title and track length, then cross-checking them
+  against each other. Only Spotify needs an account.
 * **Learns from you** — confirming a match in the review queue writes a rule, so
   that song resolves instantly and offline forever after. Radio rotations repeat
   heavily, so the queue shrinks fast.
@@ -50,35 +51,82 @@ real stream metadata is wrong. Every example below is live data from Halloween R
 | `JINGLE — Halloweenradio.net 20-1` (16s) | Rejected as station imaging before any lookup |
 | Karaoke and tribute re-recordings | Heavily penalised so they can never outrank the real thing |
 | Live bootlegs scoring identically on text | Penalised; studio releases preferred |
-| Either provider rate-limiting mid-batch | That provider pauses, matching continues on the other — **never** silently downgraded to a vague query |
+| A song two catalogues have never heard of | Two more are asked; they disagree far more often than you would expect |
+| A keyword search returning its closest guess for a song that isn't there | Rejected on artist disagreement, so noise cannot reach the queue |
+| Any provider rate-limiting mid-batch | That provider pauses, matching continues on the others — **never** silently downgraded to a vague query |
 
 The last row matters more than it looks. A failed lookup and a genuine "no such
 song" are treated as completely different outcomes: a failure leaves the song
-queued for a later retry rather than being recorded as unmatched.
+queued for a later retry rather than being recorded as unmatched. And when a
+song genuinely cannot be found, the queue says which catalogues answered and
+which could not be reached — so archiving something is a decision rather than a
+guess.
+
+### Four catalogues, and why
+
+| Provider | Account needed | What it is for |
+|---|---|---|
+| **MusicBrainz** | no | Canonical identity: stable MBIDs, careful editorial data, no commercial bias |
+| **Spotify** | yes | The playable one — a match needs a Spotify URI to reach a Spotify playlist |
+| **Deezer** | no | Coverage, and the only one that returns an **ISRC in its search results** |
+| **Apple Music** | no | The long tail: seasonal compilations, novelty singles and small-label reissues |
+
+The last two were added because "unmatched" was hiding two completely different
+problems — metadata too mangled to search on, and songs those first two
+catalogues simply do not carry. Only the second is fixed by asking somebody
+else, and holiday radio leans hard on exactly the material where MusicBrainz
+thins out and where Spotify and Deezer, which ingest from the same modern
+distributors, tend to agree with each other about nothing being there. Neither
+addition needs credentials.
+
+Deezer's ISRC earns its keep twice: cross-catalogue identity becomes an exact
+assertion rather than an inference, and a song Deezer identifies can be looked
+up on Spotify **by recording code** instead of by another fuzzy text search — so
+it reaches the playlist even when Spotify's own search could not find it.
+
+Apple Music is the one provider with no fielded query syntax: it answers keyword
+relevance and never says "nothing here", so it always returns its closest guess.
+That is precisely why it is worth asking after a fielded search has failed, and
+precisely why a candidate whose performer has nothing in common with the one the
+stream named is rejected outright. Every title comparison here deliberately
+tolerates a missing subtitle — that tolerance is what repairs stream metadata —
+and the same tolerance rates a title *fragment* highly. The artist is what
+separates the two.
 
 ### Staying inside the providers' rate limits
 
-Both providers throttle, for different reasons. MusicBrainz allows one request
-per second per client and defends its search endpoint more aggressively than a
-plain lookup; Spotify enforces a rolling-window quota per *application*, so its
-throttling follows the matcher rather than the machine it runs on.
+All four throttle, for different reasons. MusicBrainz allows one request per
+second per client and defends its search endpoint more aggressively than a plain
+lookup; Spotify enforces a rolling-window quota per *application*, so its
+throttling follows the matcher rather than the machine it runs on; Apple Music
+allows roughly twenty requests a minute per IP and reports the limit as a bare
+`403`; Deezer allows about fifty requests every five seconds and — the trap —
+reports a refusal as **HTTP 200 with an error in the body**, so a client that
+only checks the status code reads a quota rejection as "this song does not
+exist" and records it as permanently unmatched.
 
-Four things keep this app a well-behaved citizen of both:
+Four things keep this app a well-behaved citizen of all of them:
 
-- **Spacing.** For MusicBrainz a single global lock serialises every call and
-  measures the gap from the *end* of the previous request, so the real rate stays
-  just under one per second no matter how many stations are monitored.
+- **Spacing.** MusicBrainz and Apple Music each get a global lock that
+  serialises every call and measures the gap from the *end* of the previous
+  request, so the real rate stays inside the budget no matter how many stations
+  are monitored. Spotify and Deezer are two orders of magnitude inside their
+  limits at the volume this app generates, so they are throttled on refusal
+  rather than spaced.
 - **A meaningful User-Agent**, with a contact URL, as MusicBrainz policy requires.
 - **Honouring backpressure.** A `503` or `429` opens a per-provider cooldown: no
   further requests are sent until it expires, `Retry-After` leads whenever it is
   longer than our own floor, and repeated throttling escalates the pause. A
   refusal also abandons the remaining query spellings, because they would each be
   refused too. How far the pause escalates depends on how much the service tells
-  us: MusicBrainz names no delay, so its cooldown steps up to 3×, 10× then 30×;
-  Spotify does, so its own figure leads and our floor only steps up to 2×, 4×
-  then 8×.
-- **Not being parked for a day.** A single pause is capped — 15 minutes for
-  Spotify, 30 for MusicBrainz, both at or above the top escalation step so the
+  us: MusicBrainz and Apple Music name no delay, so their cooldowns step up to
+  3×, 10× then 30×; Spotify does, so its own figure leads and its floor only
+  steps up to 2×, 4× then 8×. Deezer names none either, but its quota window is
+  only five seconds wide, so it escalates gently for the same reason Spotify
+  does — a long guess there would be pure dead time.
+- **Not being parked for a day.** A single pause is capped — 5 minutes for
+  Deezer, 15 for Spotify, 30 for MusicBrainz and Apple Music, all at or above
+  the top escalation step so the
   cap never shortens our own backoff. It exists because a service can ask for far
   longer: Spotify answers an application that has broken its *longer-window*
   quota with a `Retry-After` measured in hours, and obeying that literally takes
@@ -86,11 +134,12 @@ Four things keep this app a well-behaved citizen of both:
   notice it has recovered. Capping costs one refused request per cap period and
   resumes on its own the moment the ban lifts. The Activity log says when a wait
   was capped and what was actually asked for.
-- **Degrading instead of stalling.** One cold provider means matching continues
-  on the other; the dashboard names whichever is paused and offers **Resume now**
-  to clear the cooldown, and the Activity log records it. Confidence is a little
-  lower without two databases corroborating, so expect more items in review while
-  it lasts. A cooldown is only a prediction about when the service will accept us
+- **Degrading instead of stalling.** A cold provider means matching continues on
+  the remaining three; the dashboard names whichever are paused and offers
+  **Resume now** for each, and the Activity log records it. Confidence is a
+  little lower with fewer databases corroborating, so expect more items in
+  review while it lasts — but with four catalogues, losing one is now a dent
+  rather than a halving. A cooldown is only a prediction about when the service will accept us
   again — if you know better, resuming skips the wait, and the next refusal
   simply opens a new one. Cooldown state is in-memory by design, so restarting
   the container also clears it.
@@ -99,20 +148,26 @@ Query volume is kept low for the same reason: a confident hit on the first
 spelling ends the search, so a recognisable song costs exactly one request, and
 each search has a wall-clock budget so a slow provider cannot hold the queue.
 
-A match identified through MusicBrainz alone still needs a Spotify URI to reach
-a playlist. If Spotify is throttled at that moment the match is kept anyway, and
-a healing pass in the sync loop attaches the link once Spotify answers again.
+A match identified without Spotify still needs a Spotify URI to reach a
+playlist. If Spotify is throttled at that moment the match is kept anyway, and a
+healing pass in the sync loop attaches the link once Spotify answers again.
 
 **Confidence scoring** blends title (0.42), artist (0.38) and duration (0.20)
 agreement. When a duration is unavailable the weight is redistributed rather
 than guessed. A borderline score triggers an ISRC cross-check that resolves
-identity exactly.
+identity exactly — usually for free, because Deezer already handed the code over.
 
-When both databases return the same recording it becomes **one** candidate, not
-two: the agreement raises its confidence, and the merged row carries MusicBrainz's
-MBID alongside Spotify's playable URI and artwork. So the ranked list is a list
-of genuinely different answers, and a MusicBrainz identification often arrives
-playable without a second lookup.
+When several catalogues return the same recording it becomes **one** candidate,
+not four: the agreement raises its confidence, and the merged row carries
+MusicBrainz's MBID alongside Spotify's playable URI and artwork. So the ranked
+list is a list of genuinely different answers, and an identification made
+elsewhere often arrives playable without a second lookup.
+
+How much the agreement is worth scales with how many agree — **+0.07** for the
+second catalogue, **+0.10** for the third, **+0.12** for the fourth. It is
+deliberately not proportional: the streaming catalogues ingest from overlapping
+distributors, so Spotify, Deezer and Apple agreeing is not three independent
+opinions.
 
 Defaults: **≥ 0.92** auto-accepted, **0.62–0.92** sent to review, below that
 listed as unmatched. Both thresholds are adjustable in Settings.
@@ -196,9 +251,9 @@ configuration needed to see it working.
    - Click **Connect Spotify account**
    - Click **Test Spotify access** to confirm the link can really write playlists
 
-   Without Spotify the app still works: it identifies songs through MusicBrainz
-   and writes `.m3u8` files. Spotify adds playable links, real playlists, and a
-   meaningful lift in match coverage.
+   Without Spotify the app still works, and works well: MusicBrainz, Deezer and
+   Apple Music all identify songs without an account, and `.m3u8` files are
+   written either way. What Spotify adds is playable links and real playlists.
 
    <details>
    <summary>If syncing fails with <code>403 Forbidden</code></summary>
@@ -229,7 +284,7 @@ configuration needed to see it working.
    waiting. Each shows the stream metadata, a prefilled search box, the four
    strongest candidates, and *why* each scored the way it did; weaker ones are
    one click away under **Show more**. Correcting a field and pressing Enter
-   searches MusicBrainz and Spotify at the same time. Confirming teaches the
+   searches every enabled catalogue at the same time. Confirming teaches the
    matcher permanently. Anything you would rather not decide on yet can be
    **archived**: it leaves the queue without a verdict and waits in the Library
    under *archived*, where **Restore** puts it back exactly as you left it.
@@ -290,22 +345,31 @@ Environment variables (all optional — everything else is in the UI):
 Everything else — thresholds, poll interval, provider toggles, Spotify
 credentials — is editable in Settings without restarting.
 
-Two settings govern how the app treats MusicBrainz:
+Four catalogue toggles — MusicBrainz, Spotify, Deezer and Apple Music — are in
+*Settings → Matching*. All are on by default; only Spotify needs an account, so
+switching any of the other three off costs coverage and buys nothing.
+
+Each provider's pacing is tunable too. These have sensible defaults and are
+worth touching only if a service is persistently unhappy with you:
 
 | Setting | Default | Purpose |
 |---|---|---|
 | MusicBrainz rate limit (seconds) | `1.1` | Minimum gap between MusicBrainz requests |
 | MusicBrainz cooldown (seconds) | `60` | Pause after a `503`/`429`, escalating to 3×, 10×, 30× |
 | Spotify cooldown (seconds) | `10` | Floor for Spotify's per-application quota, escalating to 2×, 4×, 8× |
+| Deezer cooldown (seconds) | `30` | Pause after a quota refusal, escalating to 2×, 4×, 8× |
+| Apple Music rate limit (seconds) | `3.0` | Minimum gap; the store allows about 20 requests a minute |
+| Apple Music cooldown (seconds) | `60` | Pause after a `403`, escalating to 3×, 10×, 30× |
 
-The two differ because the services do. MusicBrainz never says how long to wait,
-so the pause is a guess and guessing long is the safe direction. Spotify states
-its own `Retry-After` and that is honoured in full — its setting is only a floor
-to stop a tight retry loop, and its quota window is short enough that a burst is
-usually forgiven in seconds.
+They differ because the services do. MusicBrainz and Apple Music never say how
+long to wait, so the pause is a guess and guessing long is the safe direction.
+Spotify states its own `Retry-After` and that is honoured in full — its setting
+is only a floor to stop a tight retry loop. Deezer says nothing either, but its
+quota window is five seconds wide, so it is treated the gentle way for the same
+reason.
 
-Raising a cooldown is the right response to persistent throttling; lowering the
-rate limit below `1.0` is not, and will get the IP blocked.
+Raising a cooldown is the right response to persistent throttling; lowering
+either rate limit is not, and will get the IP blocked.
 
 ---
 
@@ -333,7 +397,8 @@ app/
   sources.py       AzuraCast, Icecast and ICY readers
   playlists.py     Spotify sync and M3U writing
   api.py           REST API
-  providers/       MusicBrainz and Spotify clients
+  providers/       the four catalogue clients + the shared registry they
+                   are all reached through (__init__.py)
   web/             the interface (no build step)
 tools/make_icon.py regenerates the app icon
 unraid/            UnRaid Community Applications template
@@ -347,10 +412,20 @@ unraid/            UnRaid Community Applications template
   valuably — every matching rule you have taught it.
 * **MusicBrainz is rate-limited to ~1 request/second** by design. A large backlog
   drains steadily rather than all at once; this is deliberate and polite.
-* **Worth adding later:** audio fingerprinting (AcoustID/Chromaprint) for the
-  genuinely unidentifiable tracks — obscure indie songs that exist in no
-  database. It needs real audio sampling, so it is a heavier feature, but it is
-  the natural next step if the review queue ever has a stubborn tail. The
-  provider interface is structured to accept it as another source.
+* **Adding a fifth catalogue** is one module and one line. Implement `search`,
+  `is_configured`, `status`, `resume`, `cooldown_remaining` and `aclose`, return
+  the shared candidate shape, then add a row to `REGISTRY` in
+  `app/providers/__init__.py` — the matcher's fan-out, the manual search, the
+  settings toggle, the dashboard's paused-provider banner and its **Resume now**
+  button all read that registry rather than a list of their own.
+* **What is left in the tail.** With four catalogues answering, a song none of
+  them has is usually either metadata too mangled to search on or something
+  never released commercially — station-produced content, a YouTube-only novelty
+  cut. The unmatched reason now names which catalogues answered and which could
+  not be reached, so the two are told apart before you archive anything. What
+  would genuinely help the residue is audio fingerprinting
+  (AcoustID/Chromaprint), which identifies from the sound rather than from the
+  text; it needs real audio sampling, so it is a heavier feature, but it slots
+  in as another provider.
 * **Adding another holiday** is just adding a station; set its *Holiday* field to
   pick up the matching accent colour in the UI.

@@ -32,6 +32,21 @@ const fmtWait = (seconds) => {
   return m ? `${h}h ${m}m` : `${h}h`;
 };
 
+/* Providers currently refusing calls, newest roster first. /api/stats carries
+   the whole list with its labels, so nothing here needs to know how many
+   catalogues there are or what any of them is called — a provider added
+   server-side shows up, and can be resumed, without touching this file. */
+const coldProviders = (stats) => (stats?.providers || []).filter((p) => p.throttled);
+
+/* How a candidate's `source` key is spelled for a reader. The registry itself
+   lives on the server; this is only presentation, and an unknown key falls
+   through to itself rather than rendering as blank. */
+const SOURCE_LABELS = {
+  musicbrainz: "MusicBrainz", spotify: "Spotify", deezer: "Deezer",
+  itunes: "Apple Music", alias: "learned",
+};
+const sourceLabel = (key) => SOURCE_LABELS[key] || key;
+
 const ICONS = {
   grid:   '<path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>',
   check:  '<path d="M20 6L9 17l-5-5"/>',
@@ -201,10 +216,10 @@ async function renderDashboard() {
   const c = stats.counts;
   const resolved = c.matched + c.confirmed;
   const rate = Math.round(stats.match_rate * 100);
-  // Either provider can be in a cooldown; name whichever is. The key is carried
-  // alongside the label so the resume button acts on what is being displayed.
-  const providers = [["MusicBrainz", "musicbrainz"], ["Spotify", "spotify"]];
-  const cold = providers.filter(([, key]) => stats[key]?.throttled);
+  // Any provider can be in a cooldown; name whichever are. The roster comes
+  // from /api/stats rather than from a list held here, so adding a catalogue
+  // server-side does not silently leave the dashboard unable to name it.
+  const cold = coldProviders(stats);
 
   const tiles = [
     { label: "Matched", value: resolved, foot: `${rate}% of resolved songs`, bar: rate },
@@ -215,10 +230,10 @@ async function renderDashboard() {
     // answer again and you may know better than it does.
     { label: "In queue", value: c.pending,
       foot: cold.length
-        ? cold.map(([n, key]) => `${n} paused ${fmtWait(stats[key].cooldown_seconds)}`).join(" · ")
+        ? cold.map((p) => `${p.label} paused ${fmtWait(p.cooldown_seconds)}`).join(" · ")
         : stats.worker.matching ? "matching now…" : "idle",
-      extra: cold.map(([n, key]) =>
-        `<button class="btn ghost sm" data-resume="${key}">Resume ${esc(n)} now</button>`).join("") },
+      extra: cold.map((p) =>
+        `<button class="btn ghost sm" data-resume="${esc(p.key)}">Resume ${esc(p.label)} now</button>`).join("") },
     { label: "Playlist tracks", value: stats.playlist_entries, foot: `${stats.stations} station(s)` },
     { label: "Learned rules", value: stats.aliases, foot: "auto-match forever" },
     { label: "Filtered", value: c.nonsong, foot: "jingles & station IDs" },
@@ -378,11 +393,14 @@ async function renderReviewCard(prefetched) {
     if (d.title !== undefined) sig.push(`<span class="sig ${mark(d.title)}">title ${Math.round(d.title * 100)}%</span>`);
     if (d.duration !== undefined && d.duration !== null) sig.push(`<span class="sig ${mark(d.duration)}">length ${Math.round(d.duration * 100)}%</span>`);
     else sig.push(`<span class="sig">no length</span>`);
-    if (d.corroborated) sig.push(`<span class="sig good">both databases agree</span>`);
+    // A merged row was found in several databases, so it names all of them —
+    // and how many agreed is the point, because the confidence credit scales
+    // with it. "Both" was fine with two providers and is wrong with four.
+    const sources = d.sources?.length ? d.sources : [c.source];
+    if (d.corroborated) sig.push(`<span class="sig good">${sources.length} databases agree</span>`);
     if (d.isrc_verified) sig.push(`<span class="sig good">ISRC verified</span>`);
     (d.penalties || []).forEach((p) => sig.push(`<span class="sig bad">${esc(p)}</span>`));
-    // A merged row was found in both databases, so it names both.
-    sig.push(`<span class="sig">${esc((d.sources?.length ? d.sources : [c.source]).join(" + "))}</span>`);
+    sig.push(`<span class="sig">${esc(sources.map(sourceLabel).join(" + "))}</span>`);
 
     return `
       <div class="cand ${i === 0 ? "best" : ""}">
@@ -443,7 +461,7 @@ async function renderReviewCard(prefetched) {
     <div class="card" style="margin-bottom:1rem">
       <h2>Search</h2>
       <p class="sub">Prefilled with what the stream said. Correct either field and press
-        Enter to search MusicBrainz and Spotify together — results replace the list below.</p>
+        Enter to search every enabled catalogue at once — results replace the list below.</p>
       <div class="row">
         <div class="field"><label>Artist</label>
           <input type="text" id="ms-artist" value="${esc(s.raw_artist)}"></div>
@@ -718,10 +736,18 @@ async function renderSettings() {
           <div class="field"><label>Minimum song length (seconds)</label>
             <input type="number" id="s-minlen" value="${esc(v.min_song_seconds)}">
             <span class="hint">Anything shorter is treated as a jingle or station ID.</span></div>
-          <div class="row">
-            <label class="switch"><input type="checkbox" id="s-mb" ${v.use_musicbrainz === "1" ? "checked" : ""}> Use MusicBrainz</label>
-            <label class="switch"><input type="checkbox" id="s-sp" ${v.use_spotify === "1" ? "checked" : ""}> Use Spotify search</label>
-          </div>
+          <div class="field"><label>Catalogues to search</label>
+            <div class="row">
+              <label class="switch"><input type="checkbox" id="s-mb" ${v.use_musicbrainz === "1" ? "checked" : ""}> MusicBrainz</label>
+              <label class="switch"><input type="checkbox" id="s-sp" ${v.use_spotify === "1" ? "checked" : ""}> Spotify</label>
+              <label class="switch"><input type="checkbox" id="s-dz" ${v.use_deezer === "1" ? "checked" : ""}> Deezer</label>
+              <label class="switch"><input type="checkbox" id="s-it" ${v.use_itunes === "1" ? "checked" : ""}> Apple Music</label>
+            </div>
+            <span class="hint">MusicBrainz identifies and Spotify makes it playable.
+              Deezer and Apple Music are there for the songs neither of those two
+              carries — they need no account, and turning them off only costs you
+              coverage. Agreement between catalogues raises confidence, so more of
+              them on means fewer songs stuck in review.</span></div>
         </div>
 
         <div class="card">
@@ -840,8 +866,7 @@ function applyStats(stats) {
   const worker = $("#worker-state");
   const busy = stats.worker.polling || stats.worker.matching;
   worker.classList.toggle("busy", !!busy);
-  const paused = [["MusicBrainz", stats.musicbrainz], ["Spotify", stats.spotify]]
-    .filter(([, p]) => p && p.throttled).map(([n]) => n);
+  const paused = coldProviders(stats).map((p) => p.label);
   worker.lastElementChild.textContent = paused.length ? `${paused.join(" & ")} paused`
     : stats.worker.matching ? "Matching…"
     : stats.worker.polling ? "Polling…" : "Idle";
@@ -1146,6 +1171,8 @@ document.addEventListener("click", async (ev) => {
       spotify_market: $("#s-market").value.toUpperCase(),
       use_musicbrainz: $("#s-mb").checked ? "1" : "0",
       use_spotify: $("#s-sp").checked ? "1" : "0",
+      use_deezer: $("#s-dz").checked ? "1" : "0",
+      use_itunes: $("#s-it").checked ? "1" : "0",
       m3u_enabled: $("#s-m3u").checked ? "1" : "0",
       spotify_sync_enabled: $("#s-spsync").checked ? "1" : "0",
       spotify_client_id: $("#s-cid").value.trim(),
