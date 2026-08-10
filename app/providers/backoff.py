@@ -97,35 +97,54 @@ class Breaker:
             "throttle_streak": self._streak,
         }
 
-    def open(self, retry_after: float | None = None) -> float:
+    def open(self, retry_after_header: str | None = None, status: int | None = None,
+             detail: str = "") -> float:
         """Record backpressure and refuse local calls until the cooldown expires.
+
+        Takes the **raw** `Retry-After` header rather than a parsed number, and
+        parses it here. A computed delay cannot be reasoned backwards into the
+        header that produced it: `62373` and `Sun, 10 Aug 2026 13:30:00 GMT` are
+        indistinguishable once both are floats, and they mean very different
+        things about the service refusing us. So the header is recorded verbatim
+        in the log, alongside the seconds it resolved to.
 
         Returns the delay applied, for the caller's error message.
 
         `Retry-After` leads whenever it is longer than our own floor, but it is
-        capped. A service can name a wait of many hours - Spotify does this to an
-        application that has broken its longer-window quota rather than merely
-        burst - and obeying that literally takes the provider out for the rest of
-        the day with no way to notice it has come back. Capping means one refused
-        request per cap period instead, which costs nothing and lets matching
-        resume on its own the moment the ban actually lifts.
+        capped: a service can name a wait of many hours, and obeying that
+        literally takes the provider out for the rest of the day with no way to
+        notice it has come back. Capping means one refused request per cap period
+        instead, which costs nothing and lets matching resume on its own the
+        moment the refusal actually lifts.
         """
         self._streak += 1
+        seconds = parse_retry_after(retry_after_header)
         base = max(1.0, db.get_float(self.setting_key, self.default_seconds))
         step = base * self.steps[min(self._streak, len(self.steps)) - 1]
-        asked = max(step, retry_after or 0.0)
+        asked = max(step, seconds or 0.0)
         delay = min(asked, self.max_seconds)
         self._until = max(self._until, time.monotonic() + delay)
-        note = f" {self.fallback_note}" if self.fallback_note else ""
+
+        parts = [f"{self.name} asked us to back off; pausing calls for {delay:.0f}s "
+                 f"(consecutive throttles: {self._streak})."]
+        code = f"HTTP {status}" if status else "Refused"
+        if retry_after_header is None:
+            parts.append(f"{code}, no Retry-After header.")
+        else:
+            resolved = "unusable" if seconds is None else f"{seconds:.0f}s"
+            parts.append(f'{code}, Retry-After: "{retry_after_header[:80]}" '
+                         f"read as {resolved}.")
+        if detail:
+            said = detail[:200].strip()
+            parts.append(f"It said: {said}" + ("" if said.endswith((".", "!", "?")) else "."))
         # Say so when we are deliberately not obeying in full, so a capped wait
         # is never mistaken for what the service actually asked for.
-        asked_note = (f" It asked for {asked:.0f}s; capped so we notice when it "
-                      f"recovers." if delay < asked else "")
-        db.log_event(
-            f"{self.name} asked us to back off; pausing calls for {delay:.0f}s "
-            f"(consecutive throttles: {self._streak}).{asked_note}{note}",
-            level="warn", source=self.name.lower(),
-        )
+        if delay < asked:
+            parts.append(f"Capped from {asked:.0f}s so we notice when it recovers.")
+        if self.fallback_note:
+            parts.append(self.fallback_note)
+
+        db.log_event(" ".join(parts), level="warn", source=self.name.lower())
         return delay
 
     def close(self) -> None:

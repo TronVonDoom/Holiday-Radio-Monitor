@@ -21,7 +21,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import GENTLE_STEPS, Breaker, parse_retry_after
+from .backoff import GENTLE_STEPS, Breaker
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -351,7 +351,11 @@ async def _request(method: str, path: str, *, user: bool = False,
             headers={"Authorization": f"Bearer {token}"},
         )
         if resp.status_code == 429:
-            delay = _breaker.open(parse_retry_after(resp.headers.get("Retry-After")))
+            # The raw header and Spotify's own wording both go to the log: a
+            # multi-hour pause is worth being able to attribute to what Spotify
+            # actually sent rather than to what we computed from it.
+            delay = _breaker.open(resp.headers.get("Retry-After"),
+                                  resp.status_code, _error_text(resp))
             raise SpotifyThrottled(
                 f"Spotify {method} {path} was rate limited; backing off {delay:.0f}s",
                 delay,

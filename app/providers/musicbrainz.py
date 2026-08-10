@@ -26,7 +26,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import Breaker, parse_retry_after
+from .backoff import Breaker
 
 API = "https://musicbrainz.org/ws/2/recording"
 
@@ -154,7 +154,7 @@ async def _throttled_get(params: dict[str, Any]) -> dict[str, Any] | None:
             return None
 
         if resp.status_code in (503, 429):
-            delay = _breaker.open(parse_retry_after(resp.headers.get("Retry-After")))
+            delay = _breaker.open(resp.headers.get("Retry-After"), resp.status_code)
             raise ProviderThrottled(
                 f"MusicBrainz returned {resp.status_code}; backing off {delay:.0f}s",
                 delay,
@@ -336,7 +336,7 @@ async def fetch_isrc(mbid: str) -> str:
     if resp is None:
         return ""
     if resp.status_code in (503, 429):
-        _breaker.open(parse_retry_after(resp.headers.get("Retry-After")))
+        _breaker.open(resp.headers.get("Retry-After"), resp.status_code)
         return ""
     if resp.status_code != 200:
         return ""
