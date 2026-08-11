@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Holiday Radio Matcher"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 USER_AGENT = (
     f"HolidayRadioMatcher/{APP_VERSION} "
     "( https://github.com/TronVonDoom/Holiday-Radio-Monitor )"
@@ -79,6 +79,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- Poller --------------------------------------------------------------
     "poll_interval_seconds": "45",
     "musicbrainz_rate_limit_seconds": "1.1",
+    # Minimum gap between Spotify API calls. Spotify's quota is a rolling window
+    # a few tens of seconds wide, so it is the burst that gets refused, not the
+    # daily total - and resolving one hard song can cost a dozen requests. Two a
+    # second is far more than the match queue needs to keep up and comfortably
+    # inside the window.
+    "spotify_rate_limit_seconds": "0.5",
     # How long to stop calling a provider after it returns 503/429.
     # MusicBrainz names no delay of its own, so its floor is generous and
     # escalates to 3x, 10x and 30x while the throttling persists. Spotify does
@@ -92,6 +98,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # MusicBrainz's and its cooldown guesses long, which is the safe direction
     # when a service has told you nothing.
     "deezer_cooldown_seconds": "30",
+    # Deezer has real headroom (about 50 requests per 5 seconds), so this is
+    # insurance rather than necessity - it removes the "we are comfortably inside
+    # the budget" assumption that the Spotify ban proved unsafe.
+    "deezer_rate_limit_seconds": "0.1",
     "itunes_cooldown_seconds": "60",
     "itunes_rate_limit_seconds": "3.0",
 }

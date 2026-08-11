@@ -26,7 +26,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import Breaker
+from .backoff import Breaker, Meter
 
 API = "https://musicbrainz.org/ws/2/recording"
 
@@ -70,6 +70,7 @@ class ProviderThrottled(ProviderUnavailable):
 _client: httpx.AsyncClient | None = None
 _rate_lock = asyncio.Lock()
 _last_request = 0.0
+_meter = Meter()
 
 # max_seconds sits at the top escalation step (60s x 30), so the cap never
 # shortens our own backoff - it only bounds a Retry-After asking for longer.
@@ -111,8 +112,9 @@ def cooldown_remaining() -> float:
 
 
 def status() -> dict[str, Any]:
-    """Breaker state, so a cold provider is visible instead of looking idle."""
-    return _breaker.status()
+    """Breaker state and send rate, so a cold provider is visible instead of
+    looking idle - and a provider heading for a cooldown is visible before it is."""
+    return {**_breaker.status(), **_meter.snapshot()}
 
 
 def resume() -> float:
@@ -149,6 +151,7 @@ async def _throttled_get(params: dict[str, Any]) -> dict[str, Any] | None:
             wait = interval - (time.monotonic() - _last_request)
             if wait > 0:
                 await asyncio.sleep(wait)
+            _meter.record()
             try:
                 resp = await _get_client().get(API, params=params)
             except httpx.HTTPError:
@@ -333,6 +336,7 @@ async def fetch_isrc(mbid: str) -> str:
         wait = interval - (time.monotonic() - _last_request)
         if wait > 0:
             await asyncio.sleep(wait)
+        _meter.record()
         try:
             resp = await _get_client().get(
                 f"{API}/{mbid}", params={"inc": "isrcs", "fmt": "json"}

@@ -13,11 +13,20 @@ provider is still healthy instead of blocking on the one that is not.
 
 The streak only resets on a success, so sustained throttling escalates the pause
 rather than settling into a loop that probes every minute forever.
+
+Cooldowns outlive the process. A service that has told us to wait hours has told
+us something about *our application*, not about this run of it, so the deadline
+is written to the settings table and reloaded on start. Holding it in memory
+alone meant every restart - a deploy, a crash, a machine coming back from a power
+cut - walked straight into the same refusal and started a fresh streak, which is
+how an app being punished for a burst kept re-announcing itself to the service
+punishing it.
 """
 
 from __future__ import annotations
 
 import time
+from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -61,6 +70,52 @@ def parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+class Meter:
+    """Rolling count of the requests one provider actually received.
+
+    A rate limit you cannot see is one you find out about by being banned. Every
+    number in this file - the intervals, the floors, the caps - was chosen against
+    an *estimate* of how much traffic this app generates, and the Spotify ban
+    happened because one of those estimates was wrong in a direction nothing
+    reported. The breaker records refusals, which is the symptom; this records
+    the send rate, which is the cause, and it is the only figure that can be
+    compared against a service's published budget before the refusal arrives.
+
+    Counts every request put on the wire, including ones that come back 429:
+    a refusal still costs quota, which is exactly why probing a cooldown is not
+    free.
+    """
+
+    WINDOW = 3600.0
+
+    def __init__(self) -> None:
+        self._hits: deque[float] = deque()
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self.WINDOW
+        while self._hits and self._hits[0] < cutoff:
+            self._hits.popleft()
+
+    def record(self) -> None:
+        now = time.monotonic()
+        self._hits.append(now)
+        self._trim(now)
+
+    def snapshot(self) -> dict[str, int]:
+        """Shape merged into each provider's `status()` for the dashboard."""
+        now = time.monotonic()
+        self._trim(now)
+        minute = now - 60.0
+        return {
+            "requests_1m": sum(1 for t in self._hits if t >= minute),
+            "requests_1h": len(self._hits),
+        }
+
+    def reset(self) -> None:
+        """Drop all state. For tests."""
+        self._hits.clear()
+
+
 class Breaker:
     """Per-provider circuit breaker driven by the service's own backpressure."""
 
@@ -78,12 +133,50 @@ class Breaker:
         self.max_seconds = max_seconds
         # Appended to the log line, e.g. "Matching continues on Spotify alone."
         self.fallback_note = fallback_note
+        # Wall clock, not monotonic: a deadline that has to survive a restart
+        # cannot be expressed in a clock that resets to zero on one.
         self._until = 0.0
         self._streak = 0
+        self._loaded = False
+
+    # --- persisted state -----------------------------------------------------
+
+    @property
+    def _until_key(self) -> str:
+        return f"{self.name.lower()}_cooldown_until"
+
+    @property
+    def _streak_key(self) -> str:
+        return f"{self.name.lower()}_throttle_streak"
+
+    def _load(self) -> None:
+        """Restore a cooldown left behind by an earlier run. Runs once.
+
+        Lazy rather than done in `__init__` because the breakers are module-level
+        singletons built at import time, before the database exists.
+
+        The restored wait is clamped to `max_seconds` for the same reason `open`
+        clamps: this value came off disk and is compared against a wall clock, so
+        a container that boots before NTP corrects it could otherwise read a
+        deadline days away and take the provider out with no way to notice.
+        """
+        if self._loaded:
+            return
+        self._loaded = True
+        until = db.get_float(self._until_key, 0.0)
+        if until <= 0.0:
+            return
+        self._until = min(until, time.time() + self.max_seconds)
+        self._streak = db.get_int(self._streak_key, 0)
+
+    def _persist(self) -> None:
+        db.set_setting(self._until_key, f"{self._until:.0f}")
+        db.set_setting(self._streak_key, str(self._streak))
 
     def remaining(self) -> float:
         """Seconds until the provider may be called again. 0 when available."""
-        return max(0.0, self._until - time.monotonic())
+        self._load()
+        return max(0.0, self._until - time.time())
 
     def is_open(self) -> bool:
         return self.remaining() > 0
@@ -117,13 +210,15 @@ class Breaker:
         instead, which costs nothing and lets matching resume on its own the
         moment the refusal actually lifts.
         """
+        self._load()
         self._streak += 1
         seconds = parse_retry_after(retry_after_header)
         base = max(1.0, db.get_float(self.setting_key, self.default_seconds))
         step = base * self.steps[min(self._streak, len(self.steps)) - 1]
         asked = max(step, seconds or 0.0)
         delay = min(asked, self.max_seconds)
-        self._until = max(self._until, time.monotonic() + delay)
+        self._until = max(self._until, time.time() + delay)
+        self._persist()
 
         parts = [f"{self.name} asked us to back off; pausing calls for {delay:.0f}s "
                  f"(consecutive throttles: {self._streak})."]
@@ -149,11 +244,15 @@ class Breaker:
 
     def close(self) -> None:
         """A successful request means we are inside the budget again."""
+        self._load()
+        if not self._streak and not self._until:
+            return  # already healthy; nothing to clear and nothing worth saying
         if self._streak:
             db.log_event(f"{self.name} is responding normally again.",
                          level="info", source=self.name.lower())
         self._streak = 0
         self._until = 0.0
+        self._persist()
 
     def resume(self) -> float:
         """Clear the cooldown on the user's instruction. Returns seconds skipped.
@@ -166,6 +265,7 @@ class Breaker:
         skipped = self.remaining()
         self._streak = 0
         self._until = 0.0
+        self._persist()
         if skipped > 0:
             db.log_event(
                 f"{self.name} cooldown cleared by hand with {skipped:.0f}s left; "
@@ -174,6 +274,7 @@ class Breaker:
         return skipped
 
     def reset(self) -> None:
-        """Drop all state without logging. For tests."""
+        """Drop all state without logging or touching the database. For tests."""
         self._streak = 0
         self._until = 0.0
+        self._loaded = True

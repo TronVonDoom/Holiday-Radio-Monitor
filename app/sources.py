@@ -177,14 +177,8 @@ def _parse_azuracast_song(song: dict[str, Any], duration: int | None,
     )
 
 
-async def fetch_azuracast(base_url: str, shortcode: str) -> list[Observation]:
-    base = base_url.rstrip("/")
-    resp = await _get_client().get(f"{base}/api/nowplaying/{shortcode}")
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):  # some versions wrap the station in a list
-        data = data[0] if data else {}
-
+def _observations_from_nowplaying(data: dict[str, Any]) -> list[Observation]:
+    """Read one station's nowplaying document into observations."""
     out: list[Observation] = []
 
     now_playing = data.get("now_playing") or {}
@@ -210,6 +204,54 @@ async def fetch_azuracast(base_url: str, shortcode: str) -> list[Observation]:
             is_current=False,
         ))
 
+    return out
+
+
+async def fetch_azuracast(base_url: str, shortcode: str) -> list[Observation]:
+    base = base_url.rstrip("/")
+    resp = await _get_client().get(f"{base}/api/nowplaying/{shortcode}")
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):  # some versions wrap the station in a list
+        data = data[0] if data else {}
+    return _observations_from_nowplaying(data)
+
+
+async def fetch_azuracast_server(base_url: str) -> dict[str, list[Observation]]:
+    """Every station on one AzuraCast server, keyed by shortcode, in ONE request.
+
+    `/api/nowplaying` returns the same document `/api/nowplaying/{shortcode}`
+    does, for every station on the server at once, and AzuraCast serves it from
+    a cache it refreshes on song change. Asking for it once and splitting the
+    answer is strictly cheaper for the server than asking per station - and it
+    is the endpoint AzuraCast itself recommends for polling.
+
+    This matters more than the request count suggests. These are somebody else's
+    servers: four stations on one host, polled concurrently every 45 seconds
+    forever, is a bot-shaped traffic pattern aimed at infrastructure we do not
+    own and cannot get unbanned from. Losing a music catalogue costs us some
+    confidence; losing the metadata source costs us everything, because there is
+    nothing left to match.
+
+    Raises on anything unexpected so the caller can fall back to per-station
+    polling: not every deployment exposes the unscoped endpoint.
+    """
+    base = base_url.rstrip("/")
+    resp = await _get_client().get(f"{base}/api/nowplaying")
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise RuntimeError("/api/nowplaying did not return a list of stations")
+
+    out: dict[str, list[Observation]] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        shortcode = ((entry.get("station") or {}).get("shortcode") or "").strip()
+        if shortcode:
+            out[shortcode] = _observations_from_nowplaying(entry)
+    if not out:
+        raise RuntimeError("/api/nowplaying carried no station shortcodes")
     return out
 
 

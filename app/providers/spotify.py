@@ -21,7 +21,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import GENTLE_STEPS, Breaker
+from .backoff import GENTLE_STEPS, Breaker, Meter
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -33,17 +33,30 @@ API = "https://api.spotify.com/v1"
 # another 429, and retrying the same call four times over turns one refusal into
 # minutes of dead time. See backoff.Breaker for why this is a hard stop.
 #
-# Unlike MusicBrainz, Spotify does say how long to wait, and its rolling window
-# is short - a burst that trips the quota is usually forgiven within seconds.
-# So our own floor stays small and escalates gently; a genuinely long wait comes
-# from Spotify's own Retry-After, which is still honoured in full.
+# Unlike MusicBrainz, Spotify does say how long to wait. There are really two
+# limits behind that one status code: an ordinary burst over the short rolling
+# window is forgiven within seconds, while an application that keeps overrunning
+# it is put in a penalty box for the better part of a day. Both arrive as a 429,
+# and only the size of Retry-After distinguishes them.
 #
-# The cap matters most here: Spotify answers a broken longer-window quota with a
-# Retry-After measured in hours, and taking that literally parks matching and
-# playlist delivery for the rest of the day.
+# So our own floor stays small and escalates gently - it is only there to stop a
+# tight probe loop after the mild kind. A genuinely long wait comes from
+# Spotify's own Retry-After, which leads whenever it is longer, up to the cap.
+#
+# The cap is what stops a Retry-After we cannot verify from parking the provider
+# indefinitely, but it was set far too low. Spotify answers a burst that trips its
+# longer-window quota with a Retry-After measured in hours, and that figure is
+# real: it counts down against a fixed unblock time, so nothing we do shortens it.
+# Capping it to fifteen minutes did not get us back sooner, it just meant probing
+# a service that had already said "not for another eighteen hours" seventy-odd
+# times, every one of them a request the quota still counts.
+#
+# Six hours keeps the reason the cap exists - we still find out on our own if the
+# refusal lifts early, or if the header was nonsense - at three probes across a
+# day-long ban instead of seventy.
 _breaker = Breaker(
     "Spotify", "spotify_cooldown_seconds", default_seconds=10.0, steps=GENTLE_STEPS,
-    max_seconds=900.0,
+    max_seconds=6 * 3600.0,
     fallback_note="Matching continues on MusicBrainz alone until then.",
 )
 
@@ -69,6 +82,25 @@ REQUIRED_SCOPES = ("playlist-modify-private", "playlist-modify-public",
 
 _client: httpx.AsyncClient | None = None
 _token_lock = asyncio.Lock()
+
+# One Spotify API call at a time, spaced by a minimum interval - the same
+# arrangement MusicBrainz and Apple Music have always had, and the one thing this
+# client was missing.
+#
+# Spotify's quota is a rolling window a few tens of seconds wide, so what trips
+# it is not the daily total but the burst. Resolving a song that Spotify cannot
+# find costs about eleven requests (five query spellings, an ISRC lookup, then
+# the same again to attach a playable link), and the match loop runs eight songs
+# a batch with a two second pause between batches. Unpaced, that is most of a
+# hundred requests inside a couple of seconds, which is exactly the shape of
+# traffic a rolling window exists to refuse.
+#
+# Spacing them costs throughput nobody is waiting on - the match queue is a
+# background drain, not an interactive path - and it converts that burst into a
+# steady trickle the window can absorb.
+_rate_lock = asyncio.Lock()
+_last_request = 0.0
+_meter = Meter()
 
 # In-memory access tokens: (value, expires_at_monotonic)
 _user_token: tuple[str, float] = ("", 0.0)
@@ -108,8 +140,9 @@ def cooldown_remaining() -> float:
 
 
 def status() -> dict[str, Any]:
-    """Breaker state, so a cold provider is visible instead of looking idle."""
-    return _breaker.status()
+    """Breaker state and send rate, so a cold provider is visible instead of
+    looking idle - and a provider heading for a cooldown is visible before it is."""
+    return {**_breaker.status(), **_meter.snapshot()}
 
 
 def resume() -> float:
@@ -327,6 +360,46 @@ def _error_text(resp: httpx.Response) -> str:
     return resp.text[:200].strip()
 
 
+async def _send(method: str, url: str, token: str, params: dict | None,
+                json: Any) -> httpx.Response:
+    """Send one paced request, re-checking the cooldown at the last moment.
+
+    The cooldown is re-tested *inside* the lock, and that is the point of doing
+    this here rather than at the top of `_request`. Callers queue up behind the
+    lock, so a breaker that was closed when a caller was admitted may well be
+    open by the time its turn arrives - and the caller that opened it is usually
+    the one immediately ahead in the queue.
+
+    Without this the moment a cooldown lapsed was the worst moment in the cycle:
+    every waiting caller had already passed the only check there was, so they all
+    went out together, and the first thing Spotify saw after letting us back in
+    was the same burst that got us refused. Now the first one through takes the
+    429 on everyone's behalf and the rest are turned away for free.
+    """
+    global _last_request
+
+    interval = db.get_float("spotify_rate_limit_seconds", 0.5)
+    async with _rate_lock:
+        remaining = _breaker.remaining()
+        if remaining > 0:
+            raise SpotifyThrottled(
+                f"Spotify is in cooldown for another {remaining:.0f}s", remaining
+            )
+        wait = interval - (time.monotonic() - _last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _meter.record()
+        try:
+            return await _get_client().request(
+                method, url, params=params, json=json,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        finally:
+            # Spacing is measured from when a call *finished*, so a slow response
+            # is never followed instantly by the next one.
+            _last_request = time.monotonic()
+
+
 async def _request(method: str, path: str, *, user: bool = False,
                    params: dict | None = None, json: Any = None) -> Any:
     """Perform one Spotify call, honouring backpressure.
@@ -346,10 +419,7 @@ async def _request(method: str, path: str, *, user: bool = False,
     # Only a stale-token retry remains; everything else resolves on the first try.
     for attempt in range(2):
         token = await _token(user)
-        resp = await _get_client().request(
-            method, url, params=params, json=json,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        resp = await _send(method, url, token, params, json)
         if resp.status_code == 429:
             # The raw header and Spotify's own wording both go to the log: a
             # multi-hour pause is worth being able to attribute to what Spotify

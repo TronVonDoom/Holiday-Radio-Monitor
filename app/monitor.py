@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from typing import Any
 
 from . import db, matcher, playlists, sources
@@ -111,16 +112,8 @@ def ingest(station_id: int, observations: list[sources.Observation]) -> int:
     return new_plays
 
 
-async def poll_station(station: dict[str, Any]) -> None:
-    try:
-        observations, source = await sources.fetch_station(station)
-    except Exception as exc:  # noqa: BLE001 - shown in the UI, never fatal
-        db.execute(
-            "UPDATE stations SET last_polled_at = ?, last_error = ? WHERE id = ?",
-            (db.now(), str(exc)[:500], station["id"]),
-        )
-        return
-
+def _record_poll(station: dict[str, Any], observations: list[sources.Observation],
+                 source: str) -> None:
     new_plays = ingest(int(station["id"]), observations)
     db.execute(
         "UPDATE stations SET last_polled_at = ?, last_error = NULL WHERE id = ?",
@@ -131,13 +124,105 @@ async def poll_station(station: dict[str, Any]) -> None:
                      source="poll")
 
 
+async def poll_station(station: dict[str, Any]) -> None:
+    try:
+        observations, source = await sources.fetch_station(station)
+    except Exception as exc:  # noqa: BLE001 - shown in the UI, never fatal
+        db.execute(
+            "UPDATE stations SET last_polled_at = ?, last_error = ? WHERE id = ?",
+            (db.now(), str(exc)[:500], station["id"]),
+        )
+        return
+    _record_poll(station, observations, source)
+
+
+# AzuraCast servers whose unscoped /api/nowplaying did not answer usefully,
+# mapped to when it is worth trying again. Without this memo a deployment that
+# does not expose it would pay one failed request per server on every single
+# poll, which is the opposite of the point.
+_batch_unsupported: dict[str, float] = {}
+BATCH_RETRY_AFTER = 1800.0
+
+
+async def _poll_azuracast_server(base: str, group: list[dict[str, Any]]) -> None:
+    """Poll every station on one AzuraCast server, in one request where possible.
+
+    Falls back to per-station polling *serially* rather than concurrently. The
+    fallback runs when a server is already behaving unexpectedly, which is the
+    worst moment to open four connections to it at once.
+    """
+    retry_at = _batch_unsupported.get(base, 0.0)
+    if time.monotonic() >= retry_at:
+        try:
+            by_shortcode = await sources.fetch_azuracast_server(base)
+        except Exception as exc:  # noqa: BLE001 - fall back, never fatal
+            if not retry_at:  # say it once per outage, not every 45 seconds
+                db.log_event(
+                    f"{base} did not answer /api/nowplaying ({exc}); polling its "
+                    f"{len(group)} station(s) one at a time instead.",
+                    level="warn", source="poll",
+                )
+            _batch_unsupported[base] = time.monotonic() + BATCH_RETRY_AFTER
+        else:
+            if _batch_unsupported.pop(base, None):
+                db.log_event(f"{base} is answering /api/nowplaying again; back to "
+                             "one request per server.", source="poll")
+            missed = []
+            for station in group:
+                observations = by_shortcode.get(
+                    (station["azuracast_shortcode"] or "").strip()
+                )
+                if observations:
+                    _record_poll(station, observations, "azuracast")
+                else:
+                    # In the response but silent, or not in it at all - either way
+                    # this station needs asking directly.
+                    missed.append(station)
+            for station in missed:
+                await poll_station(station)
+            return
+
+    for station in group:
+        await poll_station(station)
+
+
 async def poll_once() -> None:
+    """Read every enabled station, at most one request per server at a time.
+
+    Stations are grouped by AzuraCast server rather than polled independently.
+    Six stations used to mean six simultaneous requests, and because a network of
+    stations is normally several mounts on *one* server, most of those landed on
+    the same host at the same instant, every 45 seconds, forever.
+    """
     stations = [dict(r) for r in db.query("SELECT * FROM stations WHERE enabled = 1")]
     if not stations:
         return
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    solo: list[dict[str, Any]] = []
+    for station in stations:
+        base = (station.get("azuracast_base") or "").strip().rstrip("/")
+        if base and station.get("azuracast_shortcode"):
+            groups.setdefault(base, []).append(station)
+        else:
+            solo.append(station)
+
+    # A server hosting one station gains nothing from the batch endpoint - it
+    # would return every *other* station on that host too - so it keeps the
+    # direct call.
+    for base, group in list(groups.items()):
+        if len(group) == 1:
+            solo.extend(groups.pop(base))
+
     _state["polling"] = True
     try:
-        await asyncio.gather(*(poll_station(s) for s in stations), return_exceptions=True)
+        # Still concurrent, but now across *servers* rather than across stations,
+        # so no host sees more than one request from us at a time.
+        await asyncio.gather(
+            *(_poll_azuracast_server(base, group) for base, group in groups.items()),
+            *(poll_station(s) for s in solo),
+            return_exceptions=True,
+        )
         _state["last_poll"] = db.now()
     finally:
         _state["polling"] = False

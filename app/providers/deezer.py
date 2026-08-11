@@ -18,23 +18,26 @@ That single field does two jobs downstream:
     lookup - instead of a second fuzzy text search. So a song Deezer identifies
     and Spotify's search could not find still lands in the Spotify playlist.
 
-Deezer allows roughly 50 requests per 5 seconds per IP. A resolve spends at most
-two on it and songs are matched one at a time, so no spacing lock is needed
-here - unlike MusicBrainz, we are two orders of magnitude inside the budget. The
-breaker is still wired up, because the limit is per IP and this app is not
-necessarily the only thing on the machine using it.
+Deezer allows roughly 50 requests per 5 seconds per IP, and a resolve spends at
+most three on it, so this is the one provider with genuine headroom. It is
+spaced anyway, gently, because "we are two orders of magnitude inside the budget"
+was also true of Spotify right up until the app was banned for most of a day:
+the arithmetic was correct about the average and silent about the burst, and a
+background queue draining a backlog is all burst. A tenth of a second between
+calls costs nothing at this volume and removes the assumption entirely.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
 import httpx
 
-from .. import config
+from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import GENTLE_STEPS, Breaker
+from .backoff import GENTLE_STEPS, Breaker, Meter
 
 API = "https://api.deezer.com/search"
 
@@ -70,6 +73,9 @@ class DeezerThrottled(DeezerUnavailable):
 
 
 _client: httpx.AsyncClient | None = None
+_rate_lock = asyncio.Lock()
+_last_request = 0.0
+_meter = Meter()
 
 # Deezer names no wait of its own, but its quota window is five seconds, so a
 # refusal clears almost immediately and a generous floor would be pure dead
@@ -104,8 +110,9 @@ def cooldown_remaining() -> float:
 
 
 def status() -> dict[str, Any]:
-    """Breaker state, so a cold provider is visible instead of looking idle."""
-    return _breaker.status()
+    """Breaker state and send rate, so a cold provider is visible instead of
+    looking idle - and a provider heading for a cooldown is visible before it is."""
+    return {**_breaker.status(), **_meter.snapshot()}
 
 
 def resume() -> float:
@@ -164,14 +171,31 @@ async def _get(params: dict[str, Any]) -> list[dict[str, Any]] | None:
     quota rejection as a song that does not exist and records it as permanently
     unmatched. That is the whole reason this function exists separately.
     """
+    global _last_request
+
     remaining = cooldown_remaining()
     if remaining > 0:
         raise DeezerThrottled(f"Deezer is in cooldown for another {remaining:.0f}s", remaining)
 
-    try:
-        resp = await _get_client().get(API, params=params)
-    except httpx.HTTPError:
-        return None
+    interval = db.get_float("deezer_rate_limit_seconds", 0.1)
+    async with _rate_lock:
+        # Re-checked inside the lock: a caller admitted while the breaker was
+        # closed can reach the front of the queue after another has opened it.
+        remaining = cooldown_remaining()
+        if remaining > 0:
+            raise DeezerThrottled(
+                f"Deezer is in cooldown for another {remaining:.0f}s", remaining
+            )
+        wait = interval - (time.monotonic() - _last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _meter.record()
+        try:
+            resp = await _get_client().get(API, params=params)
+        except httpx.HTTPError:
+            return None
+        finally:
+            _last_request = time.monotonic()
 
     if resp.status_code in (429, 503):
         delay = _breaker.open(resp.headers.get("Retry-After"), resp.status_code)
