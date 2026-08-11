@@ -129,12 +129,30 @@ exist" and records it as permanently unmatched.
 
 Four things keep this app a well-behaved citizen of all of them:
 
-- **Spacing.** MusicBrainz and Apple Music each get a global lock that
-  serialises every call and measures the gap from the *end* of the previous
-  request, so the real rate stays inside the budget no matter how many stations
-  are monitored. Spotify and Deezer are two orders of magnitude inside their
-  limits at the volume this app generates, so they are throttled on refusal
-  rather than spaced.
+- **Spacing.** All four get a global lock that serialises every call and measures
+  the gap from the *end* of the previous request, so the real rate stays inside
+  the budget no matter how many stations are monitored.
+
+  Spotify and Deezer were once exempt, on the
+  reasoning that the app's daily total sat far inside the quota. That was true
+  and irrelevant: the quota is a *rolling window* tens of seconds wide, so what
+  gets refused is the burst, not the total. Resolving one song Spotify cannot
+  find costs about eleven requests — five query spellings, an ISRC lookup, then
+  the same again to attach a playable link — and the match loop runs eight songs
+  a batch, which unpaced is most of a hundred requests inside a couple of
+  seconds. A backlog is what turns that from a spike into sustained traffic, and
+  a backlog is exactly what an outage leaves behind: the stations' play history
+  backfills all at once when polling resumes.
+
+  Deezer genuinely does have headroom — about 50 requests per 5 seconds — but it
+  is spaced anyway, at a tenth of a second, because that costs nothing and
+  removes the assumption rather than re-testing it.
+- **Watching the send rate, not just the refusals.** Every provider reports how
+  many requests it has actually received in the last minute and the last hour,
+  and the dashboard shows the total with the busiest services named. A cooldown
+  is the symptom and arrives too late to act on; this is the cause, and it is the
+  only number that can be checked against a published budget while there is still
+  time to turn something down.
 - **A meaningful User-Agent**, with a contact URL, as MusicBrainz policy requires.
 - **Honouring backpressure.** A `503` or `429` opens a per-provider cooldown: no
   further requests are sent until it expires, `Retry-After` leads whenever it is
@@ -146,29 +164,60 @@ Four things keep this app a well-behaved citizen of all of them:
   steps up to 2×, 4× then 8×. Deezer names none either, but its quota window is
   only five seconds wide, so it escalates gently for the same reason Spotify
   does — a long guess there would be pure dead time.
-- **Not being parked for a day.** A single pause is capped — 5 minutes for
-  Deezer, 15 for Spotify, 30 for MusicBrainz and Apple Music, all at or above
-  the top escalation step so the
-  cap never shortens our own backoff. It exists because a service can ask for far
-  longer: Spotify answers an application that has broken its *longer-window*
-  quota with a `Retry-After` measured in hours, and obeying that literally takes
-  matching and playlist delivery out for the rest of the day with no way to
-  notice it has recovered. Capping costs one refused request per cap period and
-  resumes on its own the moment the ban lifts. The Activity log says when a wait
-  was capped and what was actually asked for.
+- **Not being parked forever.** A single pause is capped — 5 minutes for Deezer,
+  30 for MusicBrainz and Apple Music, 6 hours for Spotify — all at or above the
+  top escalation step so the cap never shortens our own backoff. It exists
+  because a service can ask for far longer than we can verify, and obeying an
+  unbounded number takes the provider out with no way to notice it has recovered.
+
+  Spotify's cap used to be 15 minutes, which was too aggressive to be safe. When
+  Spotify refuses an application that has broken its *longer-window* quota it
+  sends a `Retry-After` measured in hours, and that figure is real — it counts
+  down against a fixed unblock time, so nothing the app does shortens it.
+  Capping it to 15 minutes did not get us back sooner; it just meant probing a
+  service that had said "not for another eighteen hours" seventy-odd times, and
+  a `429` is still a request the quota counts. Six hours keeps the reason the cap
+  exists at three probes across a day-long ban instead of seventy. The Activity
+  log says when a wait was capped and what was actually asked for.
+- **Remembering across restarts.** A cooldown is written to the database, so a
+  deploy, a crash or a machine coming back from a power cut does not walk
+  straight back into the same refusal. A service that tells us to wait hours is
+  saying something about this *application*, not about this run of it. Before
+  this, every restart probed immediately and began a fresh escalation streak —
+  which is how an app being punished for a burst kept re-announcing itself to
+  the service punishing it.
 - **Degrading instead of stalling.** A cold provider means matching continues on
   the remaining three; the dashboard names whichever are paused and offers
   **Resume now** for each, and the Activity log records it. Confidence is a
   little lower with fewer databases corroborating, so expect more items in
   review while it lasts — but with four catalogues, losing one is now a dent
   rather than a halving. A cooldown is only a prediction about when the service will accept us
-  again — if you know better, resuming skips the wait, and the next refusal
-  simply opens a new one. Cooldown state is in-memory by design, so restarting
-  the container also clears it.
+  again — if you know better, **Resume now** skips the wait, and the next refusal
+  simply opens a new one. Restarting the container no longer clears it: that is
+  what the persistence above is for, and it is why resuming is a deliberate
+  button rather than a side effect of a deploy.
 
 Query volume is kept low for the same reason: a confident hit on the first
 spelling ends the search, so a recognisable song costs exactly one request, and
 each search has a wall-clock budget so a slow provider cannot hold the queue.
+
+### Being a good guest on the stations' own servers
+
+The four catalogues are large companies with published quotas. The stations are
+not: they are somebody else's AzuraCast install, and there is no support address
+to appeal an IP ban to. Losing a catalogue costs some matching confidence.
+Losing the metadata source costs everything, because there is nothing left to
+match.
+
+So stations are polled **per server, not per station**. A network is normally
+several mounts on one host, and AzuraCast's `/api/nowplaying` returns every
+station on the server in a single cached document — the same content the
+per-station endpoint gives, and the endpoint AzuraCast itself recommends for
+polling. Six stations across two servers cost two requests per cycle rather than
+six, and no host ever sees more than one request from us at a time. A server that
+does not expose the unscoped endpoint falls back to per-station polling, done
+serially rather than all at once, and is not re-probed for half an hour — a
+fallback that costs a failed request every 45 seconds is not a fallback.
 
 A match identified without Spotify still needs a Spotify URI to reach a
 playlist. If Spotify is throttled at that moment the match is kept anyway, and a
@@ -242,6 +291,13 @@ docker build -t holiday-radio-monitor:latest .
 | Config Storage | `/mnt/user/appdata/holiday-radio-matcher` | Database + settings. Back this up |
 | Playlists Folder | `/mnt/user/music/playlists` | Where `.m3u8` files are written |
 | Access Token | *(blank)* | Optional. Set to require a token to open the UI |
+
+Setting an access token puts a lock screen in front of everything except the
+health probe and Spotify's OAuth callback, neither of which can carry one. The
+token is compared in constant time, and a token supplied in the URL is exchanged
+for a cookie and immediately redirected away — a credential in an address bar
+ends up in browser history, in the referrer header and in the access log of every
+proxy between you and the container.
 
 The **WebUI** button is wired to `http://[IP]:[PORT:8080]/` and works as soon as
 the container is running.
@@ -317,15 +373,64 @@ configuration needed to see it working.
 
 | View | What it is for |
 |---|---|
-| **Dashboard** | Match rate, queue depth, what is on air across every station, recent plays, worker activity |
+| **Dashboard** | Match rate, queue depth, what is on air across every station, per-catalogue health and send rate, recent plays, worker activity |
 | **Review** | The queue: search at the top, then ranked candidates with per-signal score breakdowns. Resolve, archive for later, or mark as imaging |
 | **Library** | Every song ever seen, filterable by status, searchable, sortable by lowest confidence — where the archive lives, and where a wrongly filtered song is rescued |
 | **Playlists** | What is being delivered per station, with links into Spotify, JSON export, and duplicate cleanup |
-| **Stations** | Add, discover, test, pause and remove streams |
-| **Settings** | Thresholds, providers, Spotify link, and your learned rules |
+| **Stations** | Add, discover, test, poll, re-label, pause and remove streams |
+| **Settings** | Thresholds, catalogues, per-provider pacing, delivery, the Spotify link, and your learned rules — grouped into sections rather than one long column |
 
-The UI re-skins itself per holiday — orange and purple for Halloween, red and
-green for Christmas.
+No build step: the interface is plain ES modules and one stylesheet, so what
+ships in the image is what runs.
+
+**It re-skins itself per holiday** — orange and purple for Halloween, red and
+green for Christmas — reading the accent from whichever holiday most of your
+enabled stations are set to. A single station card carries its own station's
+colour even when the rest of the app is wearing another.
+
+**Light and dark**, following the system by default; the button in the top bar
+cycles system → light → dark and the choice is remembered.
+
+**Every view is a link.** `#/library?status=archived&q=elfman` is a real address,
+so a filtered library can be bookmarked and the Back button undoes a navigation
+rather than leaving the app.
+
+**The review queue is keyboard-first**, because it is the screen you spend real
+time in:
+
+| Key | Does |
+|---|---|
+| <kbd>←</kbd> <kbd>→</kbd> | Previous / next item |
+| <kbd>1</kbd>–<kbd>9</kbd> | Confirm that candidate |
+| <kbd>a</kbd> / <kbd>x</kbd> | Archive for later / mark as station imaging |
+| <kbd>e</kbd> | Jump to the search fields (<kbd>Enter</kbd> searches) |
+| <kbd>g</kbd> then <kbd>d r l p t s</kbd> | Jump to any view |
+| <kbd>r</kbd> / <kbd>/</kbd> / <kbd>?</kbd> | Refresh · focus search · list every shortcut |
+
+The dashboard refreshes on a timer without rebuilding itself: each block carries
+a signature of the data it was drawn from and is only redrawn when that changes,
+so the activity log keeps its scroll position and artwork is not re-fetched every
+fifteen seconds. It is **one request per refresh** — `/api/dashboard` returns
+everything the screen draws — and **none at all** while the tab is in the
+background, because nothing is being looked at.
+
+### What the interface costs the server
+
+The UI is the busiest client this app has: it polls every fifteen seconds, for as
+long as a tab is open, and does it from every tab that is open.
+
+| | Before | Now |
+|---|---|---|
+| Requests to open the app | 5 | **1** |
+| Requests per refresh | 4 | **1** |
+| Requests while the tab is hidden | 4 per tick | **0** |
+| `COUNT(*)`s behind a refresh | 5, one of them over the whole `plays` table | **0** unless something wrote since the last one |
+| Library search | full scan of `songs`, twice, per keystroke | **an index lookup** |
+
+The counts behind `/api/stats` are cached against the database's *write
+generation* rather than a clock, which makes the cache exact instead of merely
+fresh: confirming a match is a write, so the queue badge updates on the very next
+request rather than whenever a timeout happens to lapse.
 
 ---
 
@@ -401,27 +506,31 @@ Four catalogue toggles — MusicBrainz, Spotify, Deezer and Apple Music — are 
 *Settings → Matching*. All are on by default; only Spotify needs an account, so
 switching any of the other three off costs coverage and buys nothing.
 
-Each provider's pacing is tunable too. These have sensible defaults and are
-worth touching only if a service is persistently unhappy with you:
+Each provider's pacing is tunable too, in *Settings → Catalogue pacing*. These
+have sensible defaults and are worth touching only if a service is persistently
+unhappy with you:
 
 | Setting | Default | Purpose |
 |---|---|---|
 | MusicBrainz rate limit (seconds) | `1.1` | Minimum gap between MusicBrainz requests |
 | MusicBrainz cooldown (seconds) | `60` | Pause after a `503`/`429`, escalating to 3×, 10×, 30× |
+| Spotify rate limit (seconds) | `0.5` | Minimum gap between Spotify requests; its quota is a rolling window, so the burst is what matters |
 | Spotify cooldown (seconds) | `10` | Floor for Spotify's per-application quota, escalating to 2×, 4×, 8× |
+| Deezer rate limit (seconds) | `0.1` | Minimum gap; Deezer allows about 50 requests every 5 seconds |
 | Deezer cooldown (seconds) | `30` | Pause after a quota refusal, escalating to 2×, 4×, 8× |
 | Apple Music rate limit (seconds) | `3.0` | Minimum gap; the store allows about 20 requests a minute |
 | Apple Music cooldown (seconds) | `60` | Pause after a `403`, escalating to 3×, 10×, 30× |
 
 They differ because the services do. MusicBrainz and Apple Music never say how
 long to wait, so the pause is a guess and guessing long is the safe direction.
-Spotify states its own `Retry-After` and that is honoured in full — its setting
-is only a floor to stop a tight retry loop. Deezer says nothing either, but its
-quota window is five seconds wide, so it is treated the gentle way for the same
-reason.
+Spotify states its own `Retry-After` and that leads whenever it is longer than
+the floor — the floor only exists to stop a tight retry loop. Deezer says nothing
+either, but its quota window is five seconds wide, so it is treated the gentle
+way for the same reason.
 
-Raising a cooldown is the right response to persistent throttling; lowering
-either rate limit is not, and will get the IP blocked.
+Raising a cooldown is the right response to persistent throttling; lowering a
+rate limit is not, and will get you blocked — for Spotify that means the whole
+application, not just the IP.
 
 ---
 
@@ -452,6 +561,11 @@ app/
   providers/       the four catalogue clients + the shared registry they
                    are all reached through (__init__.py)
   web/             the interface (no build step)
+    index.html     the shell
+    styles.css     one design system: themes, holidays, every component
+    app.js         routing, event dispatch, chrome, the poll timer
+    js/            util · api · ui · state · router
+    js/views/      one module per view: meta, render, actions, changes
 tools/make_icon.py regenerates the app icon
 unraid/            UnRaid Community Applications template
 ```
@@ -462,6 +576,11 @@ unraid/            UnRaid Community Applications template
 
 * **Back up `/config`.** It holds the database, your Spotify link, and — most
   valuably — every matching rule you have taught it.
+* **Library search uses SQLite's FTS5 index**, kept current by triggers that fire
+  only when a song's names actually change — not on the `last_seen_at` bump every
+  play writes. It matches whole words and prefixes, so `purple peo` finds *The
+  Purple People Eater*. On a SQLite built without FTS5 the app still starts and
+  falls back to a scan, and says so in the Activity log.
 * **MusicBrainz is rate-limited to ~1 request/second** by design. A large backlog
   drains steadily rather than all at once; this is deliberate and polite.
 * **Adding a fifth catalogue** is one module and one line. Implement `search`,
@@ -479,5 +598,10 @@ unraid/            UnRaid Community Applications template
   (AcoustID/Chromaprint), which identifies from the sound rather than from the
   text; it needs real audio sampling, so it is a heavier feature, but it slots
   in as another provider.
-* **Adding another holiday** is just adding a station; set its *Holiday* field to
-  pick up the matching accent colour in the UI.
+* **Adding another holiday** is just adding a station; set its *Holiday* field —
+  editable inline on the Stations table — to pick up the matching accent colour.
+  A new palette is four custom properties in `styles.css`, one line per theme.
+* **Adding a view** is a module in `web/js/views/` exporting `meta` and
+  `render`, plus one line in `VIEWS` in `app.js`. Its buttons are wired by
+  `data-act="name"` resolving against the module's own `actions` map, so nothing
+  in the shell has to learn about them.

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -112,6 +114,49 @@ def _song_or_404(song_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+# Word characters only, so nothing a user types can reach FTS5's query parser.
+_FTS_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _fts_match(text: str) -> str:
+    """Turn free text into an FTS5 query, safely. Empty when there is no word in it.
+
+    FTS5 has a query language, and `"`, `*`, `^`, `:`, `-` and parentheses are
+    syntax in it. Handing it a raw song title is a syntax error waiting to
+    happen — `AC/DC` and `Bad Boys (Theme)` both blow up — and it is the one
+    place in this codebase where user text would reach a parser rather than a
+    bound parameter. So each word is pulled out, quoted as a literal and given a
+    prefix wildcard: `purple peo` finds *The Purple People Eater*, and a title
+    made entirely of punctuation simply yields no query at all.
+    """
+    return " ".join(f'"{word}"*' for word in _FTS_WORD.findall(text))
+
+
+def _escape_like(text: str) -> str:
+    """Neutralise LIKE's own wildcards, to be used with `ESCAPE '\\'`."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _search_clause(q: str, where: list[str], params: list[Any]) -> None:
+    """Append the search condition for `q`, by index wherever that is possible.
+
+    Falls back to a scan on a SQLite with no FTS5, and for a query with no word
+    in it to index on — `*` and `:::` are punctuation to the tokenizer but a
+    real thing to look for. The wildcards are escaped on that path, so searching
+    for a literal `%` finds the songs containing one rather than all of them.
+    """
+    match = _fts_match(q) if db.FTS_ENABLED else ""
+    if match:
+        where.append("s.id IN (SELECT rowid FROM songs_fts WHERE songs_fts MATCH ?)")
+        params.append(match)
+        return
+    where.append(
+        "(s.raw_artist LIKE ? ESCAPE '\\' OR s.raw_title LIKE ? ESCAPE '\\' OR "
+        "s.match_artist LIKE ? ESCAPE '\\' OR s.match_title LIKE ? ESCAPE '\\')"
+    )
+    params.extend([f"%{_escape_like(q)}%"] * 4)
+
+
 def _write_alias(song: dict[str, Any], payload: dict[str, Any], kind: str = "match") -> None:
     """Teach the matcher, so this metadata resolves instantly next time."""
     db.execute(
@@ -136,24 +181,57 @@ def _write_alias(song: dict[str, Any], payload: dict[str, Any], kind: str = "mat
 
 # --- dashboard ---------------------------------------------------------------
 
-@router.get("/stats")
-def stats() -> dict[str, Any]:
+# The counting half of /api/stats is the only part of it that costs anything: a
+# status histogram over `songs` and three more COUNT(*)s, one of them over
+# `plays`, which is append-only and grows all season. The dashboard asks four
+# times a minute per open tab, for an answer that cannot have changed unless
+# something wrote — so it is cached against the database's write generation.
+# That makes the cache exact rather than merely fresh: a confirmation in the
+# review queue is a write, so the queue badge updates on the very next request
+# rather than up to a TTL later. The TTL is only a backstop.
+_AGG_TTL = 10.0
+_agg_cache: tuple[int, float, dict[str, Any]] | None = None
+
+
+def _aggregates() -> dict[str, Any]:
+    global _agg_cache
+
+    generation = db.write_generation()
+    cached = _agg_cache
+    if cached and cached[0] == generation and time.monotonic() - cached[1] < _AGG_TTL:
+        return cached[2]
+
     counts = {row["status"]: row["n"] for row in
               db.query("SELECT status, COUNT(*) AS n FROM songs GROUP BY status")}
-    total_songs = sum(counts.values())
     resolved = counts.get("matched", 0) + counts.get("confirmed", 0)
-    reviewable = counts.get("review", 0) + counts.get("unmatched", 0)
-    considered = resolved + reviewable
+    considered = resolved + counts.get("review", 0) + counts.get("unmatched", 0)
 
-    return {
+    computed = {
         "counts": {s: counts.get(s, 0) for s in STATUSES},
-        "total_songs": total_songs,
+        "total_songs": sum(counts.values()),
         "total_plays": db.query_one("SELECT COUNT(*) AS n FROM plays")["n"],
         "playlist_entries": db.query_one("SELECT COUNT(*) AS n FROM playlist_entries")["n"],
         "aliases": db.query_one("SELECT COUNT(*) AS n FROM aliases")["n"],
         "stations": db.query_one("SELECT COUNT(*) AS n FROM stations WHERE enabled = 1")["n"],
+        # Which seasons are actually being monitored, so the interface can wear
+        # the right accent without a request of its own — and keep wearing the
+        # right one after a station's holiday is changed.
+        "holidays": {row["holiday"]: row["n"] for row in db.query(
+            "SELECT holiday, COUNT(*) AS n FROM stations WHERE enabled = 1 "
+            "GROUP BY holiday ORDER BY n DESC, holiday")},
         "match_rate": round(resolved / considered, 4) if considered else 0.0,
         "queue": counts.get("pending", 0),
+    }
+    # A plain assignment, and a duplicate computation under a race is harmless —
+    # both racers compute the same answer for the same generation.
+    _agg_cache = (generation, time.monotonic(), computed)
+    return computed
+
+
+@router.get("/stats")
+def stats() -> dict[str, Any]:
+    return {
+        **_aggregates(),
         "worker": monitor.state(),
         "spotify": {
             "configured": spotify.is_configured(),
@@ -206,6 +284,26 @@ def events(limit: int = Query(default=60, ge=1, le=300)) -> list[dict[str, Any]]
     return [dict(r) for r in db.query(
         "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
     )]
+
+
+@router.get("/dashboard")
+def dashboard(
+    recent_limit: int = Query(default=25, ge=1, le=200),
+    event_limit: int = Query(default=40, ge=1, le=300),
+) -> dict[str, Any]:
+    """Everything the dashboard draws, in one request.
+
+    The four calls it replaces were issued together on every refresh, which on a
+    remote UnRaid box is four round trips and four trips through the middleware
+    for one screen that is redrawn four times a minute. The individual endpoints
+    stay: they are what the rest of the interface and any script uses.
+    """
+    return {
+        "stats": stats(),
+        "nowplaying": nowplaying(),
+        "recent": recent(recent_limit),
+        "events": events(event_limit),
+    }
 
 
 # --- stations ----------------------------------------------------------------
@@ -312,9 +410,7 @@ def list_songs(
             where.append(f"s.status IN ({','.join('?' * len(wanted))})")
             params.extend(wanted)
     if q:
-        where.append("(s.raw_artist LIKE ? OR s.raw_title LIKE ? OR "
-                     "s.match_artist LIKE ? OR s.match_title LIKE ?)")
-        params.extend([f"%{q}%"] * 4)
+        _search_clause(q, where, params)
     if station_id:
         where.append("EXISTS (SELECT 1 FROM plays WHERE song_id = s.id AND station_id = ?)")
         params.append(station_id)
@@ -601,20 +697,18 @@ def resume_provider(name: str) -> dict[str, Any]:
 
 @router.get("/playlists")
 def playlist_overview() -> list[dict[str, Any]]:
-    rows = db.query(
-        "SELECT st.id, st.name, st.holiday, st.spotify_playlist_id, st.m3u_filename, "
-        "COUNT(e.id) AS entries, "
-        "SUM(CASE WHEN e.spotify_synced = 1 THEN 1 ELSE 0 END) AS spotify_synced "
-        "FROM stations st LEFT JOIN playlist_entries e ON e.station_id = st.id "
-        "GROUP BY st.id ORDER BY st.name"
-    )
-    return [dict(r) for r in rows]
+    return playlists.station_overview()
 
 
 @router.get("/playlists/{station_id}/tracks")
-def playlist_tracks(station_id: int) -> list[dict[str, Any]]:
+def playlist_tracks(
+    station_id: int,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """One page of a station's playlist, in delivery order, with the total."""
     _station_or_404(station_id)
-    return playlists.station_entries(station_id)
+    return playlists.station_entries_page(station_id, limit, offset)
 
 
 @router.post("/playlists/{station_id}/dedupe")
@@ -669,12 +763,13 @@ def get_settings() -> dict[str, Any]:
 
 @router.put("/settings")
 def put_settings(payload: SettingsIn) -> dict[str, Any]:
-    for key, value in payload.values.items():
-        # The UI sends the redaction placeholder back untouched when the user
-        # did not retype a secret.
-        if key in SECRET_KEYS and value == "********":
-            continue
-        db.set_setting(key, value)
+    # The UI sends the redaction placeholder back untouched when the user did
+    # not retype a secret. Saving the page is one edit, so it is one transaction:
+    # a crash halfway through should not leave half a settings page applied.
+    db.set_settings({
+        key: value for key, value in payload.values.items()
+        if not (key in SECRET_KEYS and value == "********")
+    })
     return get_settings()
 
 

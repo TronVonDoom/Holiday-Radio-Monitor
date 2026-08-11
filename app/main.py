@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import secrets
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import (
+    FileResponse, JSONResponse, RedirectResponse, Response,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import api, config, db, monitor, providers, sources
@@ -63,11 +66,27 @@ app = FastAPI(
 )
 
 
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+
+def _token_matches(supplied: str) -> bool:
+    """Constant-time comparison, so a wrong token gives nothing away by timing.
+
+    `==` on strings returns as soon as two bytes differ, which leaks the length
+    of the matching prefix to anyone who can time the response. That is a slow
+    attack over a network and a real one on a LAN.
+    """
+    if not supplied:
+        return False
+    return secrets.compare_digest(
+        supplied.encode("utf-8"), config.AUTH_TOKEN.encode("utf-8")
+    )
+
+
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
     """Optional shared-token gate, enabled by setting HRM_AUTH_TOKEN."""
-    token = config.AUTH_TOKEN
-    if not token:
+    if not config.AUTH_TOKEN:
         return await call_next(request)
 
     # The OAuth callback is reached from Spotify's servers, and the health probe
@@ -75,22 +94,29 @@ async def auth_guard(request: Request, call_next):
     if request.url.path in ("/api/spotify/callback", "/healthz"):
         return await call_next(request)
 
+    # A token in the query string is how the login form submits, so it has to be
+    # accepted — but only once. It is exchanged for the cookie and the user is
+    # bounced to the same address without it, because a URL is the one place a
+    # credential is guaranteed to be written down: browser history, the referrer
+    # header, and the access log of every proxy between here and the user.
+    if _token_matches(request.query_params.get("token", "")):
+        clean = request.url.remove_query_params("token")
+        response = RedirectResponse(str(clean), status_code=303)
+        response.set_cookie("hrm_token", config.AUTH_TOKEN, httponly=True,
+                            samesite="lax", max_age=COOKIE_MAX_AGE)
+        return response
+
     supplied = (
         request.headers.get("X-Auth-Token")
-        or request.query_params.get("token")
         or request.cookies.get("hrm_token")
         or ""
     )
-    if supplied != token:
+    if not _token_matches(supplied):
         if request.url.path.startswith("/api/"):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         return Response(_login_page(), media_type="text/html", status_code=401)
 
-    response = await call_next(request)
-    if request.query_params.get("token") == token:
-        response.set_cookie("hrm_token", token, httponly=True, samesite="lax",
-                            max_age=60 * 60 * 24 * 365)
-    return response
+    return await call_next(request)
 
 
 def _login_page() -> str:

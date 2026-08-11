@@ -33,16 +33,63 @@ def _safe_filename(name: str) -> str:
     return re.sub(r"-+", "-", cleaned).lower() or "playlist"
 
 
+# One definition of "deliverable", shared by every reader: M3U writing, Spotify
+# sync, the JSON export, the paged list the UI shows and the per-station totals
+# above it. Two of them disagreeing is the kind of bug that only ever surfaces as
+# a playlist one track shorter than the heading over it claims.
+DELIVERABLE_STATUSES = ("matched", "confirmed")
+_STATUS_LIST = ", ".join(f"'{s}'" for s in DELIVERABLE_STATUSES)
+
+_DELIVERABLE = (
+    "FROM playlist_entries e JOIN songs s ON s.id = e.song_id "
+    f"WHERE e.station_id = ? AND s.status IN ({_STATUS_LIST})"
+)
+_ENTRY_COLUMNS = "SELECT s.*, e.added_at, e.spotify_synced, e.m3u_synced "
+
+
+def station_overview() -> list[dict[str, Any]]:
+    """Every station with its playlist totals, counted the deliverable way.
+
+    The entry count used to come straight from `playlist_entries`, which also
+    holds rows for songs that have since been archived or reclassified as
+    imaging. So a station could report more tracks in its heading than the list
+    underneath it was able to show.
+    """
+    rows = db.query(
+        "SELECT st.id, st.name, st.holiday, st.spotify_playlist_id, st.m3u_filename, "
+        "COUNT(s.id) AS entries, "
+        "SUM(CASE WHEN s.id IS NOT NULL AND e.spotify_synced = 1 THEN 1 ELSE 0 END) "
+        "  AS spotify_synced "
+        "FROM stations st "
+        "LEFT JOIN playlist_entries e ON e.station_id = st.id "
+        f"LEFT JOIN songs s ON s.id = e.song_id AND s.status IN ({_STATUS_LIST}) "
+        "GROUP BY st.id ORDER BY st.name"
+    )
+    return [dict(r) for r in rows]
+
+
 def station_entries(station_id: int) -> list[dict[str, Any]]:
     """Every deliverable song for a station, oldest addition first."""
     rows = db.query(
-        "SELECT s.*, e.added_at, e.spotify_synced, e.m3u_synced "
-        "FROM playlist_entries e JOIN songs s ON s.id = e.song_id "
-        "WHERE e.station_id = ? AND s.status IN ('matched', 'confirmed') "
-        "ORDER BY e.added_at ASC",
-        (station_id,),
+        f"{_ENTRY_COLUMNS}{_DELIVERABLE} ORDER BY e.added_at ASC", (station_id,)
     )
     return [dict(r) for r in rows]
+
+
+def station_entries_page(station_id: int, limit: int, offset: int) -> dict[str, Any]:
+    """One screenful of a station's playlist, plus the total.
+
+    A station that has been running a season holds thousands of entries, and the
+    interface only ever shows ten of them at a time. Sending the whole list so
+    the browser could slice it was the single most expensive request the UI made,
+    and it grew with the season.
+    """
+    total = db.query_one(f"SELECT COUNT(*) AS n {_DELIVERABLE}", (station_id,))["n"]
+    rows = db.query(
+        f"{_ENTRY_COLUMNS}{_DELIVERABLE} ORDER BY e.added_at ASC LIMIT ? OFFSET ?",
+        (station_id, limit, offset),
+    )
+    return {"total": total, "items": [dict(r) for r in rows]}
 
 
 # --- M3U ---------------------------------------------------------------------

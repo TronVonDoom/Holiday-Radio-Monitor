@@ -17,9 +17,11 @@ playlist_entries song membership in a station playlist + per-target sync state
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,6 +30,15 @@ from .normalize import fingerprint
 
 _local = threading.local()
 _write_lock = threading.Lock()
+
+# Bumped by every write. Read-side caches key off it so they can be exact rather
+# than merely fresh: an answer computed at generation N is still the right answer
+# at generation N, however long ago it was computed.
+_write_generation = 0
+
+# Set during init_db. False only on a SQLite build without FTS5, where search
+# falls back to LIKE.
+FTS_ENABLED = False
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stations (
@@ -167,6 +178,9 @@ CREATE TABLE IF NOT EXISTS playlist_entries (
     UNIQUE(station_id, song_id)
 );
 CREATE INDEX IF NOT EXISTS idx_entries_station ON playlist_entries(station_id, added_at DESC);
+-- Reclassifying a song clears its playlist membership by song_id, and the merge
+-- migration reads entries the same way. Without this both scan the table.
+CREATE INDEX IF NOT EXISTS idx_entries_song ON playlist_entries(song_id);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -183,9 +197,56 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
 """
 
+# Full-text search over the four searchable name columns.
+#
+# The Library's search box used to be `LIKE '%q%'`, which no index can serve, so
+# every keystroke scanned the whole songs table twice - once to count and once
+# to page. This is an external-content index: it stores no copy of the rows, only
+# the terms, and reads the columns back out of `songs` by rowid.
+#
+# The update trigger is deliberately `UPDATE OF <the four columns>`. A plain
+# `AFTER UPDATE` fires on every poll, because ingesting a play bumps
+# `last_seen_at`, and would re-index a song several times an hour for a name
+# that never changed.
+#
+# Bump FTS_GENERATION when the indexed columns or the tokenizer change, so
+# existing databases rebuild instead of searching a stale index.
+FTS_GENERATION = "1"
+
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS songs_fts USING fts5(
+    raw_artist, raw_title, match_artist, match_title,
+    content='songs', content_rowid='id',
+    tokenize="unicode61 remove_diacritics 2"
+);
+
+CREATE TRIGGER IF NOT EXISTS songs_fts_insert AFTER INSERT ON songs BEGIN
+    INSERT INTO songs_fts(rowid, raw_artist, raw_title, match_artist, match_title)
+    VALUES (new.id, new.raw_artist, new.raw_title, new.match_artist, new.match_title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS songs_fts_delete AFTER DELETE ON songs BEGIN
+    INSERT INTO songs_fts(songs_fts, rowid, raw_artist, raw_title, match_artist, match_title)
+    VALUES ('delete', old.id, old.raw_artist, old.raw_title, old.match_artist, old.match_title);
+END;
+
+CREATE TRIGGER IF NOT EXISTS songs_fts_update
+AFTER UPDATE OF raw_artist, raw_title, match_artist, match_title ON songs BEGIN
+    INSERT INTO songs_fts(songs_fts, rowid, raw_artist, raw_title, match_artist, match_title)
+    VALUES ('delete', old.id, old.raw_artist, old.raw_title, old.match_artist, old.match_title);
+    INSERT INTO songs_fts(rowid, raw_artist, raw_title, match_artist, match_title)
+    VALUES (new.id, new.raw_artist, new.raw_title, new.match_artist, new.match_title);
+END;
+"""
+
 
 def now() -> int:
     return int(time.time())
+
+
+def write_generation() -> int:
+    """How many writes this process has made. See `_write_generation`."""
+    return _write_generation
 
 
 def connect() -> sqlite3.Connection:
@@ -213,7 +274,53 @@ def init_db() -> None:
                 (key, value),
             )
         _migrate(conn)
+        # Last, because the dedupe migration rewrites `songs` wholesale and the
+        # index has to be built from whatever it leaves behind.
+        _init_fts(conn)
         conn.commit()
+
+
+def _init_fts(conn: sqlite3.Connection) -> None:
+    """Build the search index, and cope with a SQLite that has no FTS5.
+
+    Called with `_write_lock` already held, so it must use `conn` directly.
+
+    FTS5 is compiled into every SQLite this app is likely to meet, but "likely"
+    is not "always", and a missing module should cost the user a slower search
+    rather than a container that will not start.
+    """
+    global FTS_ENABLED
+    try:
+        conn.executescript(FTS_SCHEMA)
+    except sqlite3.Error as exc:  # noqa: BLE001 - any failure means no FTS
+        FTS_ENABLED = False
+        conn.execute(
+            "INSERT INTO events(level, source, message, created_at) VALUES(?,?,?,?)",
+            ("warn", "setup",
+             f"This SQLite build has no FTS5 ({exc}); library search will fall "
+             "back to a slower scan.", now()),
+        )
+        return
+
+    FTS_ENABLED = True
+
+    # Whether the index has been populated is recorded rather than measured. An
+    # external-content FTS5 table answers a bare `COUNT(*)` by reading straight
+    # through to `songs`, so counting the two and comparing them always agrees
+    # and would never rebuild anything. Bump FTS_GENERATION to force a rebuild
+    # when the columns or the tokenizer here change.
+    built = conn.execute(
+        "SELECT value FROM settings WHERE key = 'fts_index_generation'"
+    ).fetchone()
+    if built is not None and built["value"] == FTS_GENERATION:
+        return
+
+    conn.execute("INSERT INTO songs_fts(songs_fts) VALUES('rebuild')")
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES('fts_index_generation', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (FTS_GENERATION,),
+    )
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -436,18 +543,22 @@ def query_one(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
+    global _write_generation
     conn = connect()
     with _write_lock:
         cur = conn.execute(sql, tuple(params))
         conn.commit()
+        _write_generation += 1
         return cur
 
 
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
+    global _write_generation
     conn = connect()
     with _write_lock:
         conn.executemany(sql, [tuple(p) for p in seq])
         conn.commit()
+        _write_generation += 1
 
 
 # --- settings ---------------------------------------------------------------
@@ -477,12 +588,26 @@ def get_bool(key: str, default: bool = False) -> bool:
     return get_setting(key, "1" if default else "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+_UPSERT_SETTING = (
+    "INSERT INTO settings(key, value) VALUES(?, ?) "
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+)
+
+
 def set_setting(key: str, value: str) -> None:
-    execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, str(value)),
-    )
+    execute(_UPSERT_SETTING, (key, str(value)))
+
+
+def set_settings(values: Mapping[str, Any]) -> None:
+    """Write many settings as one transaction.
+
+    Saving the Settings page writes about two dozen keys. One at a time, that is
+    two dozen turns of the write lock and two dozen fsyncs for what is logically
+    a single edit — and a crash halfway leaves half a page applied.
+    """
+    if not values:
+        return
+    executemany(_UPSERT_SETTING, [(k, str(v)) for k, v in values.items()])
 
 
 def all_settings() -> dict[str, str]:
@@ -494,15 +619,25 @@ def all_settings() -> dict[str, str]:
 
 # --- events -----------------------------------------------------------------
 
+# The log is a diagnostic tail, not an archive, so it is kept bounded — but the
+# trim used to run on every single line written, from the poll loop, which meant
+# an aggregate and a delete for each. Trimming every hundredth line costs a
+# hundredth as much and keeps the table within `_PRUNE_EVERY` rows of the cap.
+_EVENTS_KEPT = 500
+_PRUNE_EVERY = 100
+_event_counter = itertools.count(1)
+
+
 def log_event(message: str, level: str = "info", source: str = "") -> None:
     execute(
         "INSERT INTO events(level, source, message, created_at) VALUES(?, ?, ?, ?)",
         (level, source, message[:2000], now()),
     )
-    # Keep the log bounded; this is a diagnostic tail, not an archive.
-    execute(
-        "DELETE FROM events WHERE id < (SELECT MAX(id) - 500 FROM events)"
-    )
+    if next(_event_counter) % _PRUNE_EVERY == 0:
+        execute(
+            "DELETE FROM events WHERE id < (SELECT MAX(id) - ? FROM events)",
+            (_EVENTS_KEPT,),
+        )
 
 
 def db_path() -> Path:
