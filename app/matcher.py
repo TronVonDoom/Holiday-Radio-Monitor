@@ -490,9 +490,13 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
         if reason:
             return MatchResult(status="nonsong", method="filter", reason=reason)
 
-    # --- Tier 2: provider search. Every enabled catalogue at once - they share
+    # --- Tier 2: provider search. Every matching catalogue at once - they share
     # no resource, so the wait is the slowest one rather than the sum.
-    active = providers.enabled()
+    #
+    # `matching()` rather than `enabled()`: Spotify is the delivery target, not a
+    # catalogue, and is reached by exact recording code once a song is identified
+    # rather than searched for every song that airs. See `providers.matching`.
+    active = providers.matching()
     if not active:
         return MatchResult(status="unmatched", method="none",
                            reason="No match providers are enabled or configured.")
@@ -549,11 +553,28 @@ async def resolve(raw_artist: str, raw_title: str, raw_album: str,
     # in doubt, and only when we can act on the result. Runs on the pre-merge
     # list because it needs each provider's own identifiers, which a merge may
     # have folded into a row belonging to a different source.
-    if review_floor <= best["score"] < auto_accept and spotify.is_configured():
+    #
+    # This is the one place the match loop still reaches Spotify, and it earns
+    # it: an exact recording code is an identity assertion rather than a text
+    # search, it fires only for a song already destined for a human, it costs one
+    # request, and the track it confirms with carries the URI delivery needs. So
+    # it settles a review-queue item and delivers it in the same call.
+    #
+    # Gated on `is_available` rather than `is_configured`, because unticking
+    # Spotify has to silence every path that reaches it, not just the fan-out.
+    if review_floor <= best["score"] < auto_accept and providers.is_available("spotify"):
         isrc = await _tiebreak_isrc(scored)
         if isrc:
+            try:
+                confirmations = await spotify.search_isrc(isrc)
+            except spotify.SpotifyThrottled:
+                # The tie-break is an optional extra: it can raise a borderline
+                # score, never lower one. Losing it costs this song a trip
+                # through the review queue, so it is skipped rather than allowed
+                # to fail the whole resolve over a provider being unavailable.
+                confirmations = []
             verified: list[dict[str, Any]] = []
-            for track in await spotify.search_isrc(isrc):
+            for track in confirmations:
                 track["isrc"] = isrc
                 s, detail = score_candidate(raw_artist, raw_title, duration, track)
                 # An exact ISRC hit is an identity assertion, not a guess.
@@ -600,6 +621,14 @@ async def enrich_with_spotify(candidate: dict[str, Any], raw_artist: str,
     the candidate carries an ISRC - which Deezer supplies for free - the lookup
     is exact, so a song Spotify's own text search could not find still lands in
     the playlist.
+
+    Raises `SpotifyThrottled` rather than swallowing it. Returning the candidate
+    unchanged is the right response in the match loop and the wrong one in the
+    healing pass, which needs to know whether Spotify actually declined this song
+    or was never asked - it charges a retry either way, and a song charged for an
+    outage backs off toward a day of silence having never been looked up. Both
+    callers want different things from a refusal, so neither gets to have the
+    decision made for it here.
     """
     if candidate.get("source") == "spotify" or candidate.get("uri"):
         return candidate
@@ -607,19 +636,12 @@ async def enrich_with_spotify(candidate: dict[str, Any], raw_artist: str,
         return candidate
 
     isrc = candidate.get("isrc") or ""
-    try:
-        tracks = await spotify.search_isrc(isrc) if isrc else []
-        if not tracks:
-            tracks = await spotify.search(
-                candidate.get("artist") or raw_artist,
-                candidate.get("title") or raw_title,
-            )
-    except spotify.SpotifyThrottled:
-        # The identification is already correct; only the playable link is
-        # missing. Keep the match and let the sync loop attach the URI once
-        # Spotify is answering again, rather than discarding a good match or
-        # re-running the whole resolve on every retry.
-        return candidate
+    tracks = await spotify.search_isrc(isrc) if isrc else []
+    if not tracks:
+        tracks = await spotify.search(
+            candidate.get("artist") or raw_artist,
+            candidate.get("title") or raw_title,
+        )
     if not tracks:
         return candidate
 

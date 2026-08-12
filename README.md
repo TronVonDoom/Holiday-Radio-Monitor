@@ -28,9 +28,11 @@ stream metadata ──▶ normalize ──▶ match ──▶ score ──▶ �
   automatically, so a 45-second poll never misses a track.
 * **Filters station imaging** — jingles, IDs and promos are detected and never
   reach a playlist.
-* **Matches against four catalogues** — MusicBrainz, Spotify, Deezer and Apple
-  Music — scoring artist, title and track length, then cross-checking them
-  against each other. Only Spotify needs an account.
+* **Matches against three catalogues** — MusicBrainz, Deezer and Apple Music —
+  scoring artist, title and track length, then cross-checking them against each
+  other. None of them needs an account. Spotify is the *destination* rather than
+  a fourth opinion: once a song is identified, Spotify is asked for its link by
+  exact recording code, which is one request instead of five guesses.
 * **Learns from you** — confirming a match in the review queue writes a rule, so
   that song resolves instantly and offline forever after. Radio rotations repeat
   heavily, so the queue shrinks fast.
@@ -153,6 +155,16 @@ Four things keep this app a well-behaved citizen of all of them:
   is the symptom and arrives too late to act on; this is the cause, and it is the
   only number that can be checked against a published budget while there is still
   time to turn something down.
+- **Spending Spotify to a budget, not just a gap.** Watching a number only helps
+  if something acts on it, and nothing did: the hourly count was reported and
+  then ignored, so the first thing that ever enforced a sustained ceiling was
+  Spotify banning the application for the better part of a day. Spotify's calls
+  are now drawn from an hourly budget as well as spaced — a token bucket, so the
+  sustained rate *is* the budget while a short burst still runs at full speed,
+  rather than a count per clock hour whose cheapest use is a burst the moment it
+  resets. Running into it slows the loops down; it does not refuse them, until
+  the budget is set tight enough that waiting would be worse than falling back to
+  another catalogue.
 - **A meaningful User-Agent**, with a contact URL, as MusicBrainz policy requires.
 - **Honouring backpressure.** A `503` or `429` opens a per-provider cooldown: no
   further requests are sent until it expires, `Retry-After` leads whenever it is
@@ -186,12 +198,14 @@ Four things keep this app a well-behaved citizen of all of them:
   this, every restart probed immediately and began a fresh escalation streak —
   which is how an app being punished for a burst kept re-announcing itself to
   the service punishing it.
-- **Degrading instead of stalling.** A cold provider means matching continues on
-  the remaining three; the dashboard names whichever are paused and offers
+- **Degrading instead of stalling.** A cold catalogue means matching continues on
+  the remaining two; the dashboard names whichever are paused and offers
   **Resume now** for each, and the Activity log records it. Confidence is a
   little lower with fewer databases corroborating, so expect more items in
-  review while it lasts — but with four catalogues, losing one is now a dent
-  rather than a halving. A cooldown is only a prediction about when the service will accept us
+  review while it lasts. A cold *Spotify* is a different outage and the dashboard
+  says so: identification is untouched, because the match loop never asks it —
+  what waits is playlist delivery, and it resumes on its own.
+  A cooldown is only a prediction about when the service will accept us
   again — if you know better, **Resume now** skips the wait, and the next refusal
   simply opens a new one. Restarting the container no longer clears it: that is
   what the persistence above is for, and it is why resuming is a deliberate
@@ -502,9 +516,40 @@ Environment variables (all optional — everything else is in the UI):
 Everything else — thresholds, poll interval, provider toggles, Spotify
 credentials — is editable in Settings without restarting.
 
-Four catalogue toggles — MusicBrainz, Spotify, Deezer and Apple Music — are in
-*Settings → Matching*. All are on by default; only Spotify needs an account, so
-switching any of the other three off costs coverage and buys nothing.
+Four toggles — MusicBrainz, Spotify, Deezer and Apple Music — are in
+*Settings → Matching*, all on by default. The first three are what identify a
+song, need no account, and switching one off costs coverage and buys nothing.
+
+The Spotify switch means something narrower, because Spotify is not searched for
+automatic matching at all. It covers the two paths that still reach it: a manual
+search from the review queue, and the ISRC tie-break. Turning it off does not
+stop playlist delivery — that is *Settings → Delivery → Sync to Spotify*.
+
+### Why Spotify is not a matching catalogue
+
+It is the only provider here that is also a destination, and it is the only one
+whose quota is charged to the *application* rather than to this machine — which
+is why overrunning it takes the app out for hours at a time rather than seconds.
+
+Searching it for every song the stations play was not buying that back. Measured
+against a real library of 3,469 matched songs, Spotify was the winning match for
+**26** of them, and across a 260-song sample **not one** auto-accepted match
+would have dropped into the review queue without Spotify's corroboration. The
+other three already agree with each other, and Deezer returns the ISRC for free —
+which is what makes the delivery lookup exact.
+
+So the split is by *who is asking*, not by catalogue:
+
+| Path | Uses Spotify | Why |
+|---|---|---|
+| Automated match loop | no | Runs on every song forever; the other three identify them |
+| Delivery (link + playlist writes) | yes | A playlist needs a URI, fetched by recording code |
+| ISRC tie-break | yes | One exact request, borderline songs only, and it returns a URI too |
+| Manual search in the review queue | yes | One request, on demand, and the only route to a Spotify-only song |
+
+The cost is roughly one song in 130 — the ones nothing but Spotify carries — which
+now lands in review instead of matching automatically. That is what the manual
+search is for, and why it deliberately still asks Spotify.
 
 Each provider's pacing is tunable too, in *Settings → Catalogue pacing*. These
 have sensible defaults and are worth touching only if a service is persistently
@@ -514,7 +559,8 @@ unhappy with you:
 |---|---|---|
 | MusicBrainz rate limit (seconds) | `1.1` | Minimum gap between MusicBrainz requests |
 | MusicBrainz cooldown (seconds) | `60` | Pause after a `503`/`429`, escalating to 3×, 10×, 30× |
-| Spotify rate limit (seconds) | `0.5` | Minimum gap between Spotify requests; its quota is a rolling window, so the burst is what matters |
+| Spotify rate limit (seconds) | `0.5` | Minimum gap between Spotify requests; bounds the **burst** |
+| Spotify requests per hour | `1200` | Sustained ceiling; bounds the **hour**. See below — this is the one a rate limit cannot express |
 | Spotify cooldown (seconds) | `10` | Floor for Spotify's per-application quota, escalating to 2×, 4×, 8× |
 | Deezer rate limit (seconds) | `0.1` | Minimum gap; Deezer allows about 50 requests every 5 seconds |
 | Deezer cooldown (seconds) | `30` | Pause after a quota refusal, escalating to 2×, 4×, 8× |
@@ -527,6 +573,22 @@ Spotify states its own `Retry-After` and that leads whenever it is longer than
 the floor — the floor only exists to stop a tight retry loop. Deezer says nothing
 either, but its quota window is five seconds wide, so it is treated the gentle
 way for the same reason.
+
+**Spotify has two limits behind one status code**, which is why it is the only
+provider here with an hourly budget as well as a gap. A short rolling window
+forgives a burst within seconds; a long one answers a *sustained* overrun with a
+lockout measured in hours. A minimum gap speaks only to the first. Spacing calls
+half a second apart is entirely compatible with earning a 21.9-hour ban, because
+nothing in a per-request gap knows how long you have been going.
+
+Spotify publishes neither figure, and an app still in **Development mode** gets
+less headroom than one granted extended quota. So the default is not derived from
+a documented budget — there is none — but from the only hard measurement
+available: sustained traffic at the 0.5s gap provably gets refused. `1200/hour`
+is a third of a request a second, six times under that, and still enough to
+attach Spotify links to a two-thousand-song backlog in under two hours. The
+dashboard shows the hour's real count against the budget, so if it needs
+correcting, correct it from that rather than from a guess.
 
 Raising a cooldown is the right response to persistent throttling; lowering a
 rate limit is not, and will get you blocked — for Spotify that means the whole

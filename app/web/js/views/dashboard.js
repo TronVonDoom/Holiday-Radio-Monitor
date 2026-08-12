@@ -82,11 +82,37 @@ function patchTiles(stats) {
    per provider, with the way out of a cooldown attached to the provider that
    is in one. */
 
+/* A raw send count is hard to judge — Spotify's ban arrived with an hourly
+   figure that looked unremarkable against every estimate anyone had made of it.
+   So where a provider has a sustained ceiling, the count is shown against the
+   ceiling it is spending, which is the only form in which it means anything. */
+const rateText = (p) => `${p.requests_1m || 0}/min · ${p.requests_1h || 0}${
+  p.budget_per_hour ? ` of ${p.budget_per_hour}` : ""}/hr`;
+
+const rateTitle = (p) => p.budget_per_hour
+  ? "Requests sent in the last minute, and in the last hour against the hourly budget"
+  : "Requests sent in the last minute / hour";
+
+/* What losing this provider actually costs. A cold catalogue costs identification
+   and the others carry on; a cold Spotify costs playlist delivery and leaves
+   identification untouched, because the match loop never asks it. Saying
+   "matching continues on the rest" for Spotify reassures about the wrong thing. */
+export const coldNote = (cold) => {
+  if (!cold.length) return "All answering. Matching uses whichever agree.";
+  const names = cold.map((p) => p.label).join(" & ");
+  return cold.some((p) => p.background !== false)
+    ? `${names} paused — matching continues on the rest`
+    : `${names} paused — delivery is waiting; matching is unaffected`;
+};
+
 const providerRow = (p) => {
   const cls = !p.enabled || !p.configured ? "off" : p.throttled ? "paused" : "live";
   const stateText = !p.enabled ? "switched off"
     : !p.configured ? "needs credentials"
     : p.throttled ? `paused ${fmtWait(p.cooldown_seconds)}`
+    // Spotify sits in this list but is not searched like the rest of it, and a
+    // bare "ready" invites the reader to assume otherwise.
+    : p.background === false ? "ready · delivery & manual search"
     : "ready";
   return `
     <div class="provider ${cls}" data-provider="${esc(p.key)}">
@@ -96,8 +122,7 @@ const providerRow = (p) => {
         <div class="state">${esc(stateText)}</div>
       </div>
       <div class="row tight center">
-        <span class="rate" title="Requests sent in the last minute / hour">${
-          p.requests_1m || 0}/min · ${p.requests_1h || 0}/hr</span>
+        <span class="rate" title="${esc(rateTitle(p))}">${esc(rateText(p))}</span>
         ${p.throttled
           ? `<button class="btn sm" data-act="resume" data-provider="${esc(p.key)}">Resume</button>`
           : ""}
@@ -115,9 +140,7 @@ function catalogueCard(stats) {
       <div class="card-head">
         <div>
           <h2>Catalogues</h2>
-          <p class="sub">${cold.length
-            ? `${cold.map((p) => esc(p.label)).join(" & ")} paused — matching continues on the rest`
-            : "All answering. Matching uses whichever agree."}</p>
+          <p class="sub">${esc(coldNote(cold))}</p>
         </div>
         <span class="badge ${cold.length ? "review" : "ok"}"
               title="Requests sent to all catalogues in the last minute">${
@@ -138,14 +161,12 @@ function patchCatalogues(stats) {
   }
   // Same roster and same breaker states: only the counters moved.
   const cold = coldProviders(stats);
-  host.querySelector(".card-head .sub").textContent = cold.length
-    ? `${cold.map((p) => p.label).join(" & ")} paused — matching continues on the rest`
-    : "All answering. Matching uses whichever agree.";
+  host.querySelector(".card-head .sub").textContent = coldNote(cold);
   host.querySelector(".card-head .badge").textContent = `${providerCalls(stats)} req/min`;
   for (const p of stats.providers || []) {
     const row = host.querySelector(`[data-provider="${p.key}"]`);
     if (!row) continue;
-    row.querySelector(".rate").textContent = `${p.requests_1m || 0}/min · ${p.requests_1h || 0}/hr`;
+    row.querySelector(".rate").textContent = rateText(p);
     if (p.throttled) row.querySelector(".state").textContent = `paused ${fmtWait(p.cooldown_seconds)}`;
   }
   return true;

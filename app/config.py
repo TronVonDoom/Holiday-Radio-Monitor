@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Holiday Radio Matcher"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.3.0"
 USER_AGENT = (
     f"HolidayRadioMatcher/{APP_VERSION} "
     "( https://github.com/TronVonDoom/Holiday-Radio-Monitor )"
@@ -85,6 +85,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # second is far more than the match queue needs to keep up and comfortably
     # inside the window.
     "spotify_rate_limit_seconds": "0.5",
+    # Sustained ceiling, which the gap above does not provide: spacing bounds the
+    # burst and says nothing about the hour. Spotify enforces both, and it is the
+    # long one that answers an overrun with a lockout measured in hours rather
+    # than seconds. See providers.spotify.DEFAULT_HOURLY_BUDGET for where this
+    # number comes from - it is a measurement of what got refused, not a
+    # published figure, because Spotify publishes none.
+    "spotify_hourly_budget": "1200",
     # How long to stop calling a provider after it returns 503/429.
     # MusicBrainz names no delay of its own, so its floor is generous and
     # escalates to 3x, 10x and 30x while the throttling persists. Spotify does

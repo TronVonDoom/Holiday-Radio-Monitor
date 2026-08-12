@@ -21,6 +21,12 @@ alone meant every restart - a deploy, a crash, a machine coming back from a powe
 cut - walked straight into the same refusal and started a fresh streak, which is
 how an app being punished for a burst kept re-announcing itself to the service
 punishing it.
+
+A `Breaker` is a reaction, though: it can only fire once a service has already
+refused us, and a refusal from Spotify costs the better part of a day. A `Budget`
+is the matching precaution - a ceiling on sustained volume, enforced before a
+request leaves - so that the ban the breaker exists to handle is one we stop
+earning in the first place.
 """
 
 from __future__ import annotations
@@ -114,6 +120,77 @@ class Meter:
     def reset(self) -> None:
         """Drop all state. For tests."""
         self._hits.clear()
+
+
+class Budget:
+    """A long-window ceiling on how many requests one provider may be sent.
+
+    The per-request spacing every client already has bounds the *burst*. Nothing
+    bounded the *total*, and those are two different limits with two different
+    consequences. Spotify runs both behind one status code: a short rolling
+    window that forgives a burst within seconds, and a long one that answers a
+    sustained overrun with a lockout measured in hours. Spacing calls half a
+    second apart satisfies the first and says nothing whatsoever about the
+    second, which is how this app collected a 21.9-hour ban while never once
+    sending faster than two requests a second.
+
+    A token bucket rather than a fixed count per clock hour. A count refills all
+    at once, so the cheapest way to spend it is a burst the instant it resets -
+    which is the exact traffic shape being defended against. Tokens accrue
+    continuously, so the sustained rate *is* the budget, while a short burst is
+    still allowed to run at full speed.
+
+    `check` and `spend` are deliberately separate. A caller that decides not to
+    wait must not be charged for a request it never sent - which is the same
+    mistake the link-healing pass was making against its own retry counter.
+    """
+
+    WINDOW = 3600.0
+
+    def __init__(self, setting_key: str, default_per_hour: int, burst: int) -> None:
+        self.setting_key = setting_key
+        self.default_per_hour = default_per_hour
+        self.burst = float(burst)
+        self._tokens = float(burst)
+        self._refilled = time.monotonic()
+
+    def per_hour(self) -> int:
+        """The configured ceiling. Re-read each time so Settings applies live."""
+        return max(1, db.get_int(self.setting_key, self.default_per_hour))
+
+    def _refill(self) -> float:
+        """Bring the bucket up to date. Returns the fill rate per second."""
+        now = time.monotonic()
+        rate = self.per_hour() / self.WINDOW
+        self._tokens = min(self.burst, self._tokens + (now - self._refilled) * rate)
+        self._refilled = now
+        return rate
+
+    def check(self) -> float:
+        """Seconds until the next request may go out. 0.0 when it may go now."""
+        rate = self._refill()
+        if self._tokens >= 1.0:
+            return 0.0
+        return (1.0 - self._tokens) / rate
+
+    def spend(self) -> None:
+        """Charge the budget for a request that is actually going on the wire.
+
+        Only ever called once `check` has returned 0, so the bucket cannot be
+        driven negative by a caller that waited its turn.
+        """
+        self._refill()
+        self._tokens = max(0.0, self._tokens - 1.0)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Shape merged into the provider's `status()` for the dashboard."""
+        self._refill()
+        return {"budget_per_hour": self.per_hour(), "budget_ready": int(self._tokens)}
+
+    def reset(self) -> None:
+        """Refill the bucket. For tests."""
+        self._tokens = self.burst
+        self._refilled = time.monotonic()
 
 
 class Breaker:

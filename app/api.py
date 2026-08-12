@@ -494,11 +494,17 @@ async def confirm_song(song_id: int, payload: ConfirmIn) -> dict[str, Any]:
     else:
         raise HTTPException(400, "Provide a candidate, a Spotify id, or manual details.")
 
-    # A confirmation should end up playable wherever possible.
+    # A confirmation should end up playable wherever possible - but the identity
+    # the user just gave us is the point of the request, and the Spotify link is
+    # a convenience on top of it. So a throttled Spotify costs the confirmation
+    # its link, not its success; the healing pass attaches one later.
     if not chosen.get("uri"):
-        chosen = await matcher.enrich_with_spotify(
-            chosen, song["raw_artist"], song["raw_title"], song["duration"]
-        )
+        try:
+            chosen = await matcher.enrich_with_spotify(
+                chosen, song["raw_artist"], song["raw_title"], song["duration"]
+            )
+        except spotify.SpotifyThrottled:
+            pass
 
     chosen["artist"] = titlecase_display(chosen.get("artist", ""))
     chosen["title"] = titlecase_display(chosen.get("title", ""))
@@ -629,6 +635,14 @@ async def manual_search(song_id: int, payload: SearchIn) -> dict[str, Any]:
 
     The response carries a per-provider report so a missing provider reads as
     "Spotify is paused for 8s" rather than as a search that quietly found less.
+
+    Deliberately `enabled()` and not `matching()`, which is the one place the two
+    differ. The automated loop does not search Spotify - it identifies songs from
+    the other three and asks Spotify only for a playable link. But a person in the
+    review queue is the opposite case: this is one request, made on demand, into
+    the catalogue the playlist lives in, and it is the only way to reach a
+    recording that nothing but Spotify carries. Excluding it here would close the
+    escape hatch for exactly the songs the split gives up on.
     """
     song = _song_or_404(song_id)
     artist = payload.artist or song["raw_artist"]

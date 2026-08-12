@@ -19,6 +19,7 @@ from typing import Any
 
 from . import db, matcher, playlists, sources
 from .normalize import fingerprint, is_junk_album, norm_key, titlecase_display
+from .providers import spotify
 
 # How many songs one matcher pass will resolve. Kept small so the loop stays
 # responsive and MusicBrainz's 1 req/sec budget is spent steadily.
@@ -338,9 +339,16 @@ async def match_song(song: dict[str, Any]) -> str:
     if result.status == "matched":
         # A playlist needs something playable, so try to attach a Spotify URI
         # to identifications that came from MusicBrainz alone.
-        best = await matcher.enrich_with_spotify(
-            best, song["raw_artist"], song["raw_title"], song["duration"]
-        )
+        try:
+            best = await matcher.enrich_with_spotify(
+                best, song["raw_artist"], song["raw_title"], song["duration"]
+            )
+        except spotify.SpotifyThrottled:
+            # The identification is already correct and only the playable link is
+            # missing, so keep the match. `link_unlinked_songs` attaches the URI
+            # once Spotify is answering again, which is far cheaper than throwing
+            # away a good match or re-running the whole resolve to get it back.
+            pass
 
     apply_match(int(song["id"]), best, result.status, result.confidence, result.method)
 
@@ -433,9 +441,27 @@ async def _match_loop() -> None:
         await asyncio.sleep(2 if counts else 20)
 
 
-# How many unlinked songs one healing pass will try. Small so a long backlog
-# cannot turn into a burst of Spotify calls.
-LINK_BATCH = 5
+# How many unlinked songs one healing pass will try, and how long it may spend
+# trying them.
+#
+# The count used to be five, chosen "so a long backlog cannot turn into a burst
+# of Spotify calls" - but it never controlled the burst. The client's own rate
+# lock does that, and now `backoff.Budget` controls the sustained volume as well.
+# All five ever governed was how much work happened per pass, and at five per two
+# minutes a backlog of two and a half thousand songs needs seventeen hours of
+# uninterrupted Spotify availability to clear. That is longer than the gaps
+# between outages, so the queue was not draining at all - it was losing ground to
+# the new matches arriving behind it.
+#
+# The work is also far cheaper than that number assumed: most of these songs
+# carry an ISRC and resolve in one exact request.
+#
+# The deadline is what keeps the sync loop punctual. The budget paces by
+# sleeping, so a batch that runs into the ceiling slows down rather than being
+# refused, and without a clock on it a large batch could hold playlist delivery
+# up behind it.
+LINK_BATCH = 40
+LINK_PASS_SECONDS = 45.0
 
 # Backoff between attempts at the same song: 10 minutes, doubling, settling at a
 # day. Plenty of correctly identified songs are simply not on Spotify, and the
@@ -456,9 +482,13 @@ async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
     is skipped outright when Spotify is throttled. Without this pass those songs
     would stay off the Spotify playlist permanently, because sync only ever
     considers entries that already carry a URI.
-    """
-    from .providers import spotify
 
+    This is the only thing that clears that backlog, so it is also the pass whose
+    throughput decides whether the Spotify playlists keep up with the stations at
+    all. It stops for one of three reasons - the batch is done, the pass has run
+    out of clock, or Spotify has stopped answering - and only the first two are
+    allowed to cost a song an attempt.
+    """
     if not spotify.is_configured() or spotify.cooldown_remaining() > 0:
         return 0
 
@@ -466,12 +496,19 @@ async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
         "SELECT * FROM songs WHERE status IN ('matched', 'confirmed') "
         "AND (spotify_uri IS NULL OR spotify_uri = '') "
         "AND (link_after IS NULL OR link_after <= ?) "
-        "ORDER BY play_count DESC LIMIT ?",
+        # An ISRC is an exact identifier: one request, and much the highest hit
+        # rate of anything this pass does. A song without one costs up to five
+        # text searches for a worse answer, so the cheap certain work goes first
+        # and a scarce budget is spent where it converts.
+        "ORDER BY (COALESCE(isrc, '') != '') DESC, play_count DESC LIMIT ?",
         (db.now(), limit),
     )]
 
+    deadline = time.monotonic() + LINK_PASS_SECONDS
     linked = 0
     for song in songs:
+        if time.monotonic() >= deadline:
+            break
         # Record the attempt before making it, so a song that throws, times out
         # or simply is not on Spotify still backs off rather than being retried
         # on the very next pass.
@@ -496,6 +533,22 @@ async def link_unlinked_songs(limit: int = LINK_BATCH) -> int:
             merged = await matcher.enrich_with_spotify(
                 candidate, song["raw_artist"], song["raw_title"], song["duration"]
             )
+        except spotify.SpotifyThrottled:
+            # Nothing was sent on this song's behalf, so it must not be charged
+            # for the outage. Put its backoff back exactly as it was and stop:
+            # every remaining song in the batch would be refused too.
+            #
+            # This is what parked correctly matched songs for a day at a time.
+            # The attempt was written before the call, `enrich_with_spotify`
+            # swallowed the refusal, and a song Spotify had never been asked
+            # about came out of the pass looking like one Spotify had declined -
+            # then compounded, because the backoff doubles toward a full day and
+            # every subsequent outage stole another attempt from it.
+            db.execute(
+                "UPDATE songs SET link_attempts = ?, link_after = ? WHERE id = ?",
+                (attempts - 1, song["link_after"], song["id"]),
+            )
+            break
         except Exception as exc:  # noqa: BLE001 - best effort, never fatal
             db.log_event(f"Could not link {candidate['artist']} - {candidate['title']} "
                          f"to Spotify: {exc}", level="warn", source="sync")

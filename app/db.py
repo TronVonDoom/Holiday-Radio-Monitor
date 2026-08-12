@@ -368,6 +368,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ON CONFLICT(key) DO UPDATE SET value = '1'"
         )
 
+    # The Spotify-link healing pass wrote a song's retry attempt *before* making
+    # the request, and the enrichment underneath it swallowed a throttle and
+    # returned "no link found". So every song still in a batch when Spotify
+    # started refusing us was charged for an outage it was never part of, and
+    # since the backoff doubles toward a full day, a correctly matched song could
+    # end up parked for hours having never once been looked up.
+    #
+    # Nothing distinguishes a stolen attempt from a genuine "not on Spotify"
+    # after the fact, so the counter is cleared for everything still unlinked.
+    # Being wrong costs one extra search per song; leaving it alone would keep
+    # songs parked for a bug that no longer exists.
+    if "migrated_link_attempts_reset" not in done:
+        conn.execute(
+            "UPDATE songs SET link_attempts = 0, link_after = NULL "
+            "WHERE status IN ('matched', 'confirmed') "
+            "AND COALESCE(spotify_uri, '') = ''"
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('migrated_link_attempts_reset', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = '1'"
+        )
+
     # play_count used to be incremented once per *observation*. Because AzuraCast
     # serves a rolling history window, a single play was counted on every poll it
     # remained visible for, inflating the figure roughly thirtyfold. Recompute it

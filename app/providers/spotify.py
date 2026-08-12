@@ -21,7 +21,7 @@ import httpx
 
 from .. import config, db
 from ..normalize import artist_variants, title_variants
-from .backoff import GENTLE_STEPS, Breaker, Meter
+from .backoff import GENTLE_STEPS, Breaker, Budget, Meter
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -102,6 +102,38 @@ _rate_lock = asyncio.Lock()
 _last_request = 0.0
 _meter = Meter()
 
+# The other half of the pacing, and the half that was missing. Spacing keeps us
+# out of Spotify's short rolling window; this keeps us out of its long one, which
+# is the window that answers an overrun with a ban measured in hours rather than
+# seconds. See backoff.Budget for why a token bucket and not a count per hour.
+#
+# Spotify does not publish either number, and for an app still in Development
+# Mode the figure is lower than for one granted extended quota. So the default is
+# not derived from a documented budget - there is none - but from the one hard
+# measurement available: sustained traffic at this client's 2 req/s ceiling
+# earned a 21.9-hour lockout. 1200/hour is 0.33/s, six times under the rate that
+# provably gets refused, and still drains a two-thousand-song ISRC backlog inside
+# two hours. It is a setting because it is a guess, and the dashboard reports the
+# hour's actual send count next to it so the guess can be corrected from data.
+#
+# The burst is deliberately smaller than Spotify's short window rather than equal
+# to it: a full-speed burst that exactly fills that window is the one shape most
+# likely to trip the limit we are already inside.
+DEFAULT_HOURLY_BUDGET = 1200
+BUDGET_BURST = 30
+
+# How long a caller may be held waiting for the budget. The rate lock is global,
+# so waiting blocks every other Spotify caller too, and past a few seconds it is
+# better to tell the caller "not now" and let it fall back to another catalogue.
+#
+# At any budget above roughly 720/hour a single token arrives in under this, so
+# the budget paces smoothly and never refuses; set it much lower than that and it
+# starts turning callers away instead, which is the correct behaviour at a
+# ceiling that tight.
+BUDGET_MAX_WAIT = 5.0
+
+_budget = Budget("spotify_hourly_budget", DEFAULT_HOURLY_BUDGET, BUDGET_BURST)
+
 # In-memory access tokens: (value, expires_at_monotonic)
 _user_token: tuple[str, float] = ("", 0.0)
 _app_token: tuple[str, float] = ("", 0.0)
@@ -140,9 +172,10 @@ def cooldown_remaining() -> float:
 
 
 def status() -> dict[str, Any]:
-    """Breaker state and send rate, so a cold provider is visible instead of
-    looking idle - and a provider heading for a cooldown is visible before it is."""
-    return {**_breaker.status(), **_meter.snapshot()}
+    """Breaker state, send rate and remaining budget, so a cold provider is
+    visible instead of looking idle - and a provider heading for a cooldown is
+    visible before it is."""
+    return {**_breaker.status(), **_meter.snapshot(), **_budget.snapshot()}
 
 
 def resume() -> float:
@@ -385,9 +418,25 @@ async def _send(method: str, url: str, token: str, params: dict | None,
             raise SpotifyThrottled(
                 f"Spotify is in cooldown for another {remaining:.0f}s", remaining
             )
+
+        # Checked inside the lock for the same reason the breaker is: the budget
+        # is a shared resource, and testing it before queueing would let every
+        # waiting caller through on one token.
+        owed = _budget.check()
+        if owed > BUDGET_MAX_WAIT:
+            raise SpotifyThrottled(
+                f"Spotify hourly budget is spent; next request in {owed:.0f}s", owed
+            )
+        if owed > 0:
+            await asyncio.sleep(owed)
+
         wait = interval - (time.monotonic() - _last_request)
         if wait > 0:
             await asyncio.sleep(wait)
+        # Charged only now that the request is certain to be sent, and counted
+        # even if it comes back 429: a refusal spends quota too, which is exactly
+        # why probing an open cooldown is not free.
+        _budget.spend()
         _meter.record()
         try:
             return await _get_client().request(
@@ -552,6 +601,13 @@ async def search_isrc(isrc: str) -> list[dict[str, Any]]:
         data = await _api_get(
             "/search", params={"q": f"isrc:{isrc}", "type": "track", "limit": 5, "market": market}
         )
+    except SpotifyThrottled:
+        # Refused, not answered - and the difference is load-bearing here.
+        # SpotifyThrottled is a SpotifyError, so returning [] for it reported a
+        # lookup that never happened as "Spotify does not have this recording".
+        # The link-healing pass reads that as a verdict and backs the song off,
+        # which is how songs got parked for a day over an outage.
+        raise
     except SpotifyError:
         return []
     return [_parse_track(i) for i in ((data.get("tracks") or {}).get("items") or [])]

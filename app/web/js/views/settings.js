@@ -50,8 +50,14 @@ const PACING = [
 ];
 
 const CATALOGUES = [
-  ["use_musicbrainz", "MusicBrainz"], ["use_spotify", "Spotify"],
-  ["use_deezer", "Deezer"], ["use_itunes", "Apple Music"],
+  ["use_musicbrainz", "MusicBrainz", ""],
+  ["use_spotify", "Spotify",
+    "Not searched for automatic matching. The other three identify a song and Spotify is then "
+    + "asked for a playable link by recording code, which is one exact request instead of five "
+    + "guesses. This switch covers the paths that do reach it: a manual search from the review "
+    + "queue, and the ISRC tie-break. Turning it off does not stop playlist delivery."],
+  ["use_deezer", "Deezer", ""],
+  ["use_itunes", "Apple Music", ""],
 ];
 
 /* ------------------------------------------------------------- fragments -- */
@@ -104,14 +110,15 @@ export async function render(host) {
     <div class="card">
       <div class="card-head"><div>
         <h2>Catalogues to search</h2>
-        <p class="sub">MusicBrainz identifies and Spotify makes it playable. Deezer and Apple Music
-          are there for the songs neither of those two carries — they need no account, and turning
-          them off only costs coverage. Agreement between catalogues raises confidence, so more of
-          them on means fewer songs stuck in review.</p>
+        <p class="sub">MusicBrainz, Deezer and Apple Music do the identifying — they need no
+          account, and turning one off only costs coverage. Agreement between them raises
+          confidence, so more of them on means fewer songs stuck in review. Spotify is the
+          destination rather than a fourth opinion: it is asked what a song's link is, not what
+          the song is.</p>
       </div></div>
       <div class="grid duo">
-        ${CATALOGUES.map(([key, label]) =>
-          switchRow(key, label, "", v[key] === "1")).join("")}
+        ${CATALOGUES.map(([key, label, note]) =>
+          switchRow(key, label, note, v[key] === "1")).join("")}
       </div>
     </div>`);
 
@@ -161,6 +168,15 @@ export async function render(host) {
           persistent throttling; lowering a <em>rate limit</em> is not, and will get you blocked —
           for Spotify that means the whole application, not just this machine.</p>
       </div></div>
+      <div class="form-grid">
+        ${numberField("spotify_hourly_budget", "Spotify — requests per hour",
+          "The ceiling a rate limit cannot express. Spotify runs a short window that forgives a "
+          + "burst in seconds and a long one that answers a sustained overrun with a ban lasting "
+          + "hours, and only this setting speaks to the second. Spotify publishes no figure, so "
+          + "the default is drawn from what has actually been refused. Lower it if you are banned "
+          + "again; the dashboard shows the hour's real count beside it.",
+          v.spotify_hourly_budget, 'min="60" step="60"')}
+      </div>
       <div class="grid">
         ${PACING.map((p) => `
           <div class="form-grid" style="border-top:1px solid var(--border-soft);padding-top:1rem">
